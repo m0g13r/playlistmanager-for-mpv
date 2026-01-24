@@ -11,15 +11,17 @@ class MPVQtManager(QMainWindow):
         self.setWindowTitle("Playlist Manager")
         self.socket_path, self.fav_file = "/tmp/mpvsocket", os.path.expanduser("~/.mpv_favorites.json")
         self.last_m3u_file = os.path.expanduser("~/.mpv_last_playlist.json")
+        self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
         self.favorites, self.sort_mode = self.load_favs(), 0
         self.current_playing_filename = ""
         self.current_group, self.m3u_groups = "Alle", {}
         self.full_list, self.is_updating = [], False
+        self.resume_done = False
         self.signals = UpdateSignals()
         self.signals.finished.connect(self._finalize_update)
         self.apply_styles()
         self.ensure_mpv_running()
-        self.resize(500, 750)
+        self.load_window_state()
         self.setAcceptDrops(True)
         central = QWidget()
         self.setCentralWidget(central)
@@ -68,6 +70,23 @@ class MPVQtManager(QMainWindow):
         except: return set()
     def save_favs(self):
         with open(self.fav_file, "w") as f: json.dump(list(self.favorites), f)
+    def load_window_state(self):
+        try:
+            with open(self.config_file, "r") as f:
+                c = json.load(f)
+                self.move(c.get("x", 100), c.get("y", 100))
+                self.resize(c.get("w", 500), c.get("h", 750))
+                self.last_file = c.get("last_file", "")
+        except: 
+            self.resize(500, 750)
+            self.last_file = ""
+    def closeEvent(self, event):
+        g = self.geometry()
+        path_res = self.send_command({"command": ["get_property", "path"]})
+        curr_path = path_res.get("data", "") if path_res else ""
+        with open(self.config_file, "w") as f:
+            json.dump({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(), "last_file": curr_path}, f)
+        super().closeEvent(event)
     def send_command(self, cmd):
         client = None
         try:
@@ -119,6 +138,13 @@ class MPVQtManager(QMainWindow):
         self.current_playing_filename = curr_path
         self.update_combo(groups)
         self.filter_playlist()
+        if not self.resume_done and self.last_file:
+            for item in self.full_list:
+                if item["filename"] == self.last_file:
+                    self.send_command({"command": ["set_property", "playlist-pos", item["orig_idx"]]})
+                    self.send_command({"command": ["set_property", "pause", True]})
+                    self.resume_done = True
+                    break
         self.is_updating = False
     def update_combo(self, groups):
         active = self.group_combo.currentText() or self.current_group

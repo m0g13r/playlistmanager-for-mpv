@@ -23,5 +23,6 @@ A-Z is also sorting the internal playlist
 
 selecting a group from dropdown sets selected group lists on top of internal playlist
 
+.
 
 ![alt text](https://raw.githubusercontent.com/m0g13r/playlistmanager-for-mpv/refs/heads/main/pic.png?raw=true)

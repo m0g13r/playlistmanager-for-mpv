@@ -11,5 +11,7 @@ while [ ! -S /tmp/mpvsocket ]; do sleep 0.1; done
 
 python3 /your path to/playlist_gtk/qt.py
 
+right click = add to Favorites
+
 
 ![alt text](https://raw.githubusercontent.com/m0g13r/playlistmanager-for-mpv/refs/heads/main/pic.png?raw=true)

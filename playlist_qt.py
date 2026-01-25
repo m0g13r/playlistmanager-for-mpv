@@ -6,11 +6,7 @@ import subprocess
 import re
 import threading
 from pathlib import Path
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, 
-    QFrame, QMenu
-)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QCursor
 os.environ["QT_ACCESSIBILITY"] = "0"
@@ -109,8 +105,7 @@ class MPVQtManager(QMainWindow):
             s.connect(self.socket_path)
             s.close()
         except Exception:
-            try:
-                subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try: subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             except Exception: pass
     def load_favs(self):
         try:
@@ -181,8 +176,15 @@ class MPVQtManager(QMainWindow):
             items.append({"name": name, "filename": fname, "orig_idx": idx, "group": grp})
         def sort_priority(x):
             is_fav = x["name"] in self.favorites
-            return (not is_fav, x["name"].lower())
+            in_group = (self.current_group == "All Tracks") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
+            return (not in_group, not is_fav, x["name"].lower())
         full_sorted = sorted(items, key=sort_priority, reverse=(self.sort_mode == 1))
+        for target_idx, item in enumerate(full_sorted):
+            if item["orig_idx"] != target_idx:
+                self.send_command({"command": ["playlist-move", item["orig_idx"], target_idx]})
+                for other in items:
+                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx: other["orig_idx"] += 1
+                item["orig_idx"] = target_idx
         self.signals.finished.emit(g_counts, full_sorted, curr_path)
     def _finalize_update(self, group_counts, full_sorted, curr_path):
         self.full_list = full_sorted
@@ -214,7 +216,7 @@ class MPVQtManager(QMainWindow):
         menu.exec(self.group_btn.mapToGlobal(QPoint(0, self.group_btn.height())))
     def set_active_group(self, name):
         self.current_group = name
-        self.filter_playlist()
+        self.update_playlist()
     def show_burger_menu(self):
         menu = QMenu(self)
         menu.addAction("Open Playlist").triggered.connect(self.on_load_clicked)
@@ -236,28 +238,24 @@ class MPVQtManager(QMainWindow):
                 if grp != self.current_group: continue
             if q and q not in name.lower(): continue
             is_playing = (fname == self.current_playing_filename)
-            display_name = name
-            if is_f: display_name = f"★ {display_name}"
+            display_name = f"★ {name}" if is_f else name
             if is_playing: display_name = f"▶  {display_name}"
             q_item = QStandardItem(display_name)
             q_item.setData(idx, self.USER_ROLE)
             if is_playing:
                 font = QFont(); font.setBold(True); q_item.setFont(font)
-                q_item.setBackground(QColor("#3584e4"))
-                q_item.setForeground(QColor("#ffffff"))
+                q_item.setBackground(QColor("#3584e4")); q_item.setForeground(QColor("#ffffff"))
                 scroll_to_index = q_item.index()
             self.list_model.appendRow(q_item)
         if scroll_to_index: self.tree_view.scrollTo(scroll_to_index, QAbstractItemView.PositionAtCenter)
     def update_now_playing(self):
         path_res = self.send_command({"command": ["get_property", "path"]})
         if path_res and "data" in path_res:
-            new_path = path_res["data"]
-            if new_path != self.current_playing_filename:
-                self.current_playing_filename = new_path
+            if path_res["data"] != self.current_playing_filename:
+                self.current_playing_filename = path_res["data"]
                 self.filter_playlist()
         res = self.send_command({"command": ["get_property", "media-title"]})
-        title = res.get('data') if (res and "data" in res) else "MPV"
-        self.setWindowTitle(str(title))
+        self.setWindowTitle(str(res.get('data')) if (res and "data" in res) else "MPV")
     def toggle_sort(self):
         self.sort_mode = 1 - self.sort_mode
         self.update_playlist()
@@ -283,12 +281,8 @@ class MPVQtManager(QMainWindow):
         if os.path.exists(self.last_m3u_file):
             try:
                 with open(self.last_m3u_file, "r", encoding="utf-8") as f:
-                    d = json.load(f)
-                    self.sort_mode = d.get("sort_mode", 0)
-                    p = d.get("path")
-                    if p:
-                        self.load_playlist_file(p)
-                        return
+                    d = json.load(f); self.sort_mode = d.get("sort_mode", 0); p = d.get("path")
+                    if p: self.load_playlist_file(p); return
             except Exception: pass
         self.update_playlist()
     def dragEnterEvent(self, e):
@@ -301,9 +295,7 @@ class MPVQtManager(QMainWindow):
         p, _ = QFileDialog.getOpenFileName(self, "Playlist", "", "M3U (*.m3u *.m3u8);;All (*)")
         if p: self.load_playlist_file(p)
     def on_clear_clicked(self):
-        self.send_command({"command": ["playlist-clear"]})
-        self.m3u_groups = {}
-        self.update_playlist()
+        self.send_command({"command": ["playlist-clear"]}); self.m3u_groups = {}; self.update_playlist()
     def on_right_click(self, pos):
         idx = self.tree_view.indexAt(pos)
         if idx.isValid():
@@ -312,17 +304,13 @@ class MPVQtManager(QMainWindow):
                 name = item.text().replace("★ ", "").replace("▶  ", "").replace("• ", "")
                 if name in self.favorites: self.favorites.remove(name)
                 else: self.favorites.add(name)
-                self.save_favs()
-                self.update_playlist()
+                self.save_favs(); self.update_playlist()
     def on_row_activated(self, idx):
-        try:
-            orig_idx = idx.data(self.USER_ROLE)
-            if orig_idx is not None:
-                self.send_command({"command": ["set_property", "playlist-pos", orig_idx]})
-                self.send_command({"command": ["set_property", "pause", False]})
-        except Exception: pass
+        orig_idx = idx.data(self.USER_ROLE)
+        if orig_idx is not None:
+            self.send_command({"command": ["set_property", "playlist-pos", orig_idx]})
+            self.send_command({"command": ["set_property", "pause", False]})
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = MPVQtManager()
-    win.show()
+    win = MPVQtManager(); win.show()
     sys.exit(app.exec())

@@ -19,7 +19,7 @@ drag and drop
 
 right click = add to Favorites
 
-A-Z is also sorting the internal playlist
+Toggle Sort - is also sorting the internal playlist
 
 selecting a group from dropdown sets selected group lists on top of internal playlist
 

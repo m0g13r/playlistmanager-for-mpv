@@ -25,4 +25,4 @@ selecting a group from dropdown sets selected group lists on top of internal pla
 
 .
 
-![alt text](https://raw.githubusercontent.com/m0g13r/playlistmanager-for-mpv/refs/heads/main/pic.png?raw=true)
+![alt text](https://raw.githubusercontent.com/m0g13r/playlistmanager-for-mpv/refs/heads/main/pic.png)

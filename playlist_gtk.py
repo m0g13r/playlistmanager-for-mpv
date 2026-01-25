@@ -11,7 +11,7 @@ class MPVGTKManager(Gtk.Window):
         self.last_m3u_file = os.path.expanduser("~/.mpv_last_playlist.json")
         self.config_file = os.path.expanduser("~/.mpv_gtk_config.json")
         self.favorites, self.sort_mode, self.current_playing_idx = self.load_favs(), 0, -1
-        self.current_group, self.m3u_groups = "Alle", {}
+        self.current_group, self.m3u_groups = "All", {}
         self.full_list_data, self.is_updating = [], False
         self.resume_done = False
         self.last_file = ""
@@ -28,7 +28,7 @@ class MPVGTKManager(Gtk.Window):
         self.connect("drag-data-received", self.on_drag_data_received)
         self.connect("delete-event", self.on_delete_event)
         
-        self.search_entry = Gtk.SearchEntry(placeholder_text="Suchen...")
+        self.search_entry = Gtk.SearchEntry(placeholder_text="Search...")
         self.search_entry.connect("changed", lambda w: self.filter.refilter())
         self.vbox.pack_start(self.search_entry, False, False, 5)
         
@@ -61,7 +61,7 @@ class MPVGTKManager(Gtk.Window):
         self.bbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
         self.vbox.pack_start(self.bbox, False, False, 5)
         
-        for label, cb in [("M3U", self.on_load_clicked), ("Leeren", self.on_clear_clicked), ("A-Z", self.toggle_sort), ("Refresh", lambda x: self.update_playlist())]:
+        for label, cb in [("M3U", self.on_load_clicked), ("Clear", self.on_clear_clicked), ("A-Z", self.toggle_sort), ("Refresh", lambda x: self.update_playlist())]:
             btn = Gtk.Button(label=label)
             btn.connect("clicked", cb)
             self.bbox.pack_start(btn, True, True, 0)
@@ -143,7 +143,7 @@ class MPVGTKManager(Gtk.Window):
         
         def sort_priority(x):
             is_fav = x["name"] in self.favorites
-            in_sel_group = (self.current_group == "Alle") or (self.current_group == "★ Favoriten" and is_fav) or (x["group"] == self.current_group)
+            in_sel_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
             return (not in_sel_group, not is_fav, x["name"].lower())
         
         full_sorted = sorted(items, key=sort_priority, reverse=(self.sort_mode == 1))
@@ -192,7 +192,7 @@ class MPVGTKManager(Gtk.Window):
         active = self.group_combo.get_active_text() or self.current_group
         self.group_combo.handler_block_by_func(self.on_group_changed)
         self.group_combo.remove_all()
-        opts = ["Alle", "★ Favoriten"] + sorted(list(groups))
+        opts = ["All", "★ Favorites"] + sorted(list(groups))
         for o in opts: self.group_combo.append_text(o)
         if active in opts: self.group_combo.set_active(opts.index(active))
         else: self.group_combo.set_active(0)
@@ -211,14 +211,14 @@ class MPVGTKManager(Gtk.Window):
         name = model[iter][0].replace("★ ", "")
         grp = model[iter][3]
         q = self.search_entry.get_text().lower()
-        if self.current_group == "★ Favoriten":
+        if self.current_group == "★ Favorites":
             if name not in self.favorites: return False
-        elif self.current_group != "Alle":
+        elif self.current_group != "All":
             if grp != self.current_group: return False
         return q in name.lower()
 
     def on_group_changed(self, combo):
-        self.current_group = combo.get_active_text() or "Alle"
+        self.current_group = combo.get_active_text() or "All"
         self.update_playlist()
 
     def toggle_sort(self, w):

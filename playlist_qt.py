@@ -14,7 +14,7 @@ class MPVQtManager(QMainWindow):
         self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
         self.favorites, self.sort_mode = self.load_favs(), 0
         self.current_playing_filename = ""
-        self.current_group, self.m3u_groups = "Alle", {}
+        self.current_group, self.m3u_groups = "All", {}
         self.full_list, self.is_updating = [], False
         self.resume_done = False
         self.signals = UpdateSignals()
@@ -29,7 +29,7 @@ class MPVQtManager(QMainWindow):
         self.vbox.setSpacing(5)
         self.vbox.setContentsMargins(5, 5, 5, 5)
         self.search_entry = QLineEdit()
-        self.search_entry.setPlaceholderText("Suchen...")
+        self.search_entry.setPlaceholderText("Search...")
         self.search_entry.textChanged.connect(self.filter_playlist)
         self.vbox.addWidget(self.search_entry)
         self.group_combo = QComboBox()
@@ -46,7 +46,7 @@ class MPVQtManager(QMainWindow):
         self.vbox.addWidget(self.tree_view)
         self.bbox = QHBoxLayout()
         self.bbox.setSpacing(2)
-        for label, cb in [("M3U", self.on_load_clicked), ("Leeren", self.on_clear_clicked), ("A-Z", self.toggle_sort), ("Refresh", self.update_playlist)]:
+        for label, cb in [("M3U", self.on_load_clicked), ("Clear", self.on_clear_clicked), ("A-Z", self.toggle_sort), ("Refresh", self.update_playlist)]:
             btn = QPushButton(label)
             btn.clicked.connect(cb)
             self.bbox.addWidget(btn)
@@ -123,7 +123,7 @@ class MPVQtManager(QMainWindow):
             items.append({"name": name, "filename": fname, "orig_idx": idx, "group": grp})
         def sort_priority(x):
             is_fav = x["name"] in self.favorites
-            in_sel_group = (self.current_group == "Alle") or (self.current_group == "★ Favoriten" and is_fav) or (x["group"] == self.current_group)
+            in_sel_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
             return (not in_sel_group, not is_fav, x["name"].lower())
         full_sorted = sorted(items, key=sort_priority, reverse=(self.sort_mode == 1))
         for target_idx, item in enumerate(full_sorted):
@@ -150,7 +150,7 @@ class MPVQtManager(QMainWindow):
         active = self.group_combo.currentText() or self.current_group
         self.group_combo.blockSignals(True)
         self.group_combo.clear()
-        opts = ["Alle", "★ Favoriten"] + sorted(list(groups))
+        opts = ["All", "★ Favorites"] + sorted(list(groups))
         self.group_combo.addItems(opts)
         idx = self.group_combo.findText(active)
         self.group_combo.setCurrentIndex(idx if idx != -1 else 0)
@@ -163,9 +163,9 @@ class MPVQtManager(QMainWindow):
         for item in self.full_list:
             name, grp, idx, fname = item["name"], item["group"], item["orig_idx"], item["filename"]
             is_f = name in self.favorites
-            if self.current_group == "★ Favoriten":
+            if self.current_group == "★ Favorites":
                 if not is_f: continue
-            elif self.current_group != "Alle":
+            elif self.current_group != "All":
                 if grp != self.current_group: continue
             if q and q not in name.lower(): continue
             q_item = QStandardItem(f"★ {name}" if is_f else name)
@@ -194,7 +194,7 @@ class MPVQtManager(QMainWindow):
         title = res['data'] if res and "data" in res else "Playlist Manager"
         self.setWindowTitle(title)
     def on_group_changed(self, text):
-        self.current_group = text or "Alle"
+        self.current_group = text or "All"
         self.update_playlist()
     def toggle_sort(self):
         self.sort_mode = 1 - self.sort_mode

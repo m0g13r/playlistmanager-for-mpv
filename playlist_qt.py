@@ -102,10 +102,13 @@ class MPVQtManager(QMainWindow):
         """)
     def ensure_mpv_running(self):
         try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(0.25)
-            s.connect(self.socket_path)
-            s.close()
+            if os.path.exists(self.socket_path):
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.2)
+                s.connect(self.socket_path)
+                s.close()
+            else:
+                raise FileNotFoundError
         except Exception:
             try: subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             except Exception: pass

@@ -126,16 +126,19 @@ class MPVQtManager(QMainWindow):
                     self.move(c.get("x", 100), c.get("y", 100))
                     self.resize(c.get("w", 320), c.get("h", 750))
                     self.last_file = c.get("last_file", "")
+                    self.current_group = c.get("current_group", "All")
         except Exception: pass
-    def closeEvent(self, event):
+    def save_config(self):
         try:
             g = self.geometry()
             path_res = self.send_command({"command": ["get_property", "path"]})
             curr_path = path_res.get("data", "") if path_res else ""
             Path(os.path.dirname(self.config_file) or ".").mkdir(parents=True, exist_ok=True)
             with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(), "last_file": curr_path}, f)
+                json.dump({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(), "last_file": curr_path, "current_group": self.current_group}, f)
         except Exception: pass
+    def closeEvent(self, event):
+        self.save_config()
         super().closeEvent(event)
     def send_command(self, cmd, timeout=0.5):
         client = None
@@ -216,6 +219,7 @@ class MPVQtManager(QMainWindow):
         menu.exec(self.group_btn.mapToGlobal(QPoint(0, self.group_btn.height())))
     def set_active_group(self, name):
         self.current_group = name
+        self.save_config()
         self.update_playlist()
     def show_burger_menu(self):
         menu = QMenu(self)

@@ -205,6 +205,7 @@ class MPVGTKManager(Gtk.Window):
         self.group_menu.show_all()
     def on_group_selected(self, mi, name):
         self.current_group = name
+        self.save_window_state_now()
         self.update_playlist()
     def update_now_playing(self):
         path_res = self.send_command({"command": ["get_property", "path"]})
@@ -284,16 +285,19 @@ class MPVGTKManager(Gtk.Window):
                     self.move(c.get("x", 100), c.get("y", 100))
                     self.resize(c.get("w", 280), c.get("h", 750))
                     self.last_file_to_resume = c.get("last_file", "")
+                    self.current_group = c.get("current_group", "All")
         except:
             pass
-    def on_delete_event(self, w, e):
+    def save_window_state_now(self):
         try:
             path_res = self.send_command({"command": ["get_property", "path"]})
             curr_p = path_res.get("data", "") if path_res else ""
             with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump({"x": self.get_position()[0], "y": self.get_position()[1], "w": self.get_size()[0], "h": self.get_size()[1], "last_file": curr_p}, f)
+                json.dump({"x": self.get_position()[0], "y": self.get_position()[1], "w": self.get_size()[0], "h": self.get_size()[1], "last_file": curr_p, "current_group": self.current_group}, f)
         except:
             pass
+    def on_delete_event(self, w, e):
+        self.save_window_state_now()
         Gtk.main_quit()
     def on_drag_data_received(self, w, c, x, y, s, i, t):
         uris = s.get_uris()

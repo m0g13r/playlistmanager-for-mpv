@@ -16,6 +16,7 @@ class MPVQtManager(QMainWindow):
     USER_ROLE = Qt.UserRole
     def __init__(self):
         super().__init__()
+        self.lock = threading.Lock()
         self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowCloseButtonHint)
         self.setAcceptDrops(True)
         self.setWindowTitle("MPV")
@@ -23,7 +24,8 @@ class MPVQtManager(QMainWindow):
         self.fav_file = os.path.expanduser("~/.mpv_favorites.json")
         self.last_m3u_file = os.path.expanduser("~/.mpv_last_playlist.json")
         self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
-        self.favorites = self.load_favs()
+        with self.lock:
+            self.favorites = self.load_favs()
         self.sort_mode = 0
         self.current_playing_filename = ""
         self.current_group = "All"
@@ -114,29 +116,32 @@ class MPVQtManager(QMainWindow):
         except Exception: pass
         return set()
     def save_favs(self):
-        try:
-            Path(os.path.dirname(self.fav_file) or ".").mkdir(parents=True, exist_ok=True)
-            with open(self.fav_file, "w", encoding="utf-8") as f: json.dump(list(self.favorites), f)
-        except Exception: pass
+        with self.lock:
+            try:
+                Path(os.path.dirname(self.fav_file) or ".").mkdir(parents=True, exist_ok=True)
+                with open(self.fav_file, "w", encoding="utf-8") as f: json.dump(list(self.favorites), f)
+            except Exception: pass
     def load_window_state(self):
-        try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    c = json.load(f)
-                    self.move(c.get("x", 100), c.get("y", 100))
-                    self.resize(c.get("w", 320), c.get("h", 750))
-                    self.last_file = c.get("last_file", "")
-                    self.current_group = c.get("current_group", "All")
-        except Exception: pass
+        with self.lock:
+            try:
+                if os.path.exists(self.config_file):
+                    with open(self.config_file, "r", encoding="utf-8") as f:
+                        c = json.load(f)
+                        self.move(c.get("x", 100), c.get("y", 100))
+                        self.resize(c.get("w", 320), c.get("h", 750))
+                        self.last_file = c.get("last_file", "")
+                        self.current_group = c.get("current_group", "All")
+            except Exception: pass
     def save_config(self):
-        try:
-            g = self.geometry()
-            path_res = self.send_command({"command": ["get_property", "path"]})
-            curr_path = path_res.get("data", "") if path_res else ""
-            Path(os.path.dirname(self.config_file) or ".").mkdir(parents=True, exist_ok=True)
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(), "last_file": curr_path, "current_group": self.current_group}, f)
-        except Exception: pass
+        g = self.geometry()
+        path_res = self.send_command({"command": ["get_property", "path"]})
+        curr_path = path_res.get("data", "") if path_res else ""
+        with self.lock:
+            try:
+                Path(os.path.dirname(self.config_file) or ".").mkdir(parents=True, exist_ok=True)
+                with open(self.config_file, "w", encoding="utf-8") as f:
+                    json.dump({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(), "last_file": curr_path, "current_group": self.current_group}, f)
+            except Exception: pass
     def closeEvent(self, event):
         self.save_config()
         super().closeEvent(event)
@@ -171,6 +176,8 @@ class MPVQtManager(QMainWindow):
             self.is_updating = False
             return
         g_counts, items = {}, []
+        with self.lock:
+            favs_copy = set(self.favorites)
         for idx, i in enumerate(res["data"]):
             fname = i.get("filename", "")
             name = i.get("title") or os.path.basename(fname)
@@ -178,16 +185,10 @@ class MPVQtManager(QMainWindow):
             g_counts[grp] = g_counts.get(grp, 0) + 1
             items.append({"name": name, "filename": fname, "orig_idx": idx, "group": grp})
         def sort_priority(x):
-            is_fav = x["name"] in self.favorites
+            is_fav = x["name"] in favs_copy
             in_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
             return (not in_group, not is_fav, x["name"].lower())
         full_sorted = sorted(items, key=sort_priority, reverse=(self.sort_mode == 1))
-        for target_idx, item in enumerate(full_sorted):
-            if item["orig_idx"] != target_idx:
-                self.send_command({"command": ["playlist-move", item["orig_idx"], target_idx]})
-                for other in items:
-                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx: other["orig_idx"] += 1
-                item["orig_idx"] = target_idx
         self.signals.finished.emit(g_counts, full_sorted, curr_path)
     def _finalize_update(self, group_counts, full_sorted, curr_path):
         self.full_list = full_sorted
@@ -204,7 +205,9 @@ class MPVQtManager(QMainWindow):
         self.is_updating = False
     def show_group_menu(self):
         menu = QMenu(self)
-        fav_count = sum(1 for x in self.full_list if x["name"] in self.favorites)
+        with self.lock:
+            favs_copy = set(self.favorites)
+        fav_count = sum(1 for x in self.full_list if x["name"] in favs_copy)
         for g_name, count in [("All", len(self.full_list)), ("★ Favorites", fav_count)]:
             label = f"{g_name} ({count})"
             if self.current_group == g_name: label = f"• {label}"
@@ -233,9 +236,11 @@ class MPVQtManager(QMainWindow):
         self.list_model.clear()
         q = self.search_entry.text().lower().strip()
         scroll_to_index = None
+        with self.lock:
+            favs_copy = set(self.favorites)
         for item in self.full_list:
             name, grp, idx, fname = item["name"], item["group"], item["orig_idx"], item["filename"]
-            is_f = name in self.favorites
+            is_f = name in favs_copy
             if "Favorites" in self.current_group:
                 if not is_f: continue
             elif "All" not in self.current_group:
@@ -306,8 +311,9 @@ class MPVQtManager(QMainWindow):
             item = self.list_model.itemFromIndex(idx)
             if item:
                 name = item.text().replace("★ ", "").replace("▶  ", "").replace("• ", "")
-                if name in self.favorites: self.favorites.remove(name)
-                else: self.favorites.add(name)
+                with self.lock:
+                    if name in self.favorites: self.favorites.remove(name)
+                    else: self.favorites.add(name)
                 self.save_favs(); self.update_playlist()
     def on_row_activated(self, idx):
         orig_idx = idx.data(self.USER_ROLE)

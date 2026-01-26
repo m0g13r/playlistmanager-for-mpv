@@ -22,7 +22,7 @@ class MPVGTKManager(Gtk.Window):
         self.current_playing_path = ""
         self.last_file_to_resume = ""
         self.resume_done = False
-        self.current_group = "All Tracks"
+        self.current_group = "All"
         self.m3u_groups = {}
         self.full_list_data = []
         self.is_updating = False
@@ -106,7 +106,7 @@ class MPVGTKManager(Gtk.Window):
             items.append({"name": name, "filename": fn, "orig_idx": idx, "group": grp})
         def sort_p(x):
             is_fav = x["name"] in self.favorites
-            in_group = (self.current_group == "All Tracks") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
+            in_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
             return (not in_group, not is_fav, x["name"].lower())
         full_sorted = sorted(items, key=sort_p, reverse=(self.sort_mode == 1))
         for target_idx, item in enumerate(full_sorted):
@@ -121,7 +121,7 @@ class MPVGTKManager(Gtk.Window):
         for i in full_sorted:
             is_p = i["filename"] == curr_p; is_f = i["name"] in self.favorites
             dn = f"★ {i['name']}" if is_f else i['name']
-            if is_p: dn = f"▶  {dn}"
+            if is_p: dn = f"▶  {dn}"
             bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
             it = self.list_store.append([dn, i["orig_idx"], w, i["group"], fg, bg, i["filename"]])
             if is_p: active_path = self.list_store.get_path(it)
@@ -140,8 +140,11 @@ class MPVGTKManager(Gtk.Window):
         self.is_updating = False
     def rebuild_group_menu(self, groups):
         for c in self.group_menu.get_children(): self.group_menu.remove(c)
-        for o in ["All Tracks", "★ Favorites"] + sorted(list(groups)):
-            lbl = f"• {o}" if o == self.current_group else f"  {o}"
+        counts = {"All": len(self.full_list_data), "★ Favorites": sum(1 for x in self.full_list_data if x["name"] in self.favorites)}
+        for g in groups: counts[g] = sum(1 for x in self.full_list_data if x["group"] == g)
+        for o in ["All", "★ Favorites"] + sorted(list(groups)):
+            lbl = f"{o} ({counts.get(o, 0)})"
+            if o == self.current_group: lbl = f"• {lbl}"
             item = Gtk.MenuItem(label=lbl); item.connect("activate", self.on_group_selected, o); self.group_menu.append(item)
         self.group_menu.show_all()
     def on_group_selected(self, mi, name):
@@ -154,17 +157,17 @@ class MPVGTKManager(Gtk.Window):
         self.set_title(str(res.get('data')) if (res and "data" in res) else "MPV")
         return True
     def filter_func(self, model, iter, data):
-        dn = model.get_value(iter, 0); name = dn.replace("★ ", "").replace("▶  ", "")
+        dn = model.get_value(iter, 0); name = dn.replace("★ ", "").replace("▶  ", "")
         grp = model.get_value(iter, 3); q = self.search_entry.get_text().lower()
         if self.current_group == "★ Favorites":
             if name not in self.favorites: return False
-        elif self.current_group != "All Tracks" and grp != self.current_group: return False
+        elif self.current_group != "All" and grp != self.current_group: return False
         return q in name.lower()
     def toggle_sort(self, mi):
         self.sort_mode = 1 - self.sort_mode; self.update_playlist()
     def on_load_clicked(self, mi):
         diag = Gtk.FileChooserDialog(title="Playlist", parent=self, action=Gtk.FileChooserAction.OPEN)
-        diag.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OPEN, Gtk.ResponseType.OK)
+        diag.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Open", Gtk.ResponseType.OK)
         if diag.run() == Gtk.ResponseType.OK: self.load_playlist_file(diag.get_filename())
         diag.destroy()
     def on_clear_clicked(self, mi):
@@ -175,7 +178,7 @@ class MPVGTKManager(Gtk.Window):
             if pi:
                 f_iter = self.filter.get_iter(pi[0])
                 if f_iter:
-                    dn = self.filter.get_value(f_iter, 0); n = dn.replace("★ ", "").replace("▶  ", "").strip()
+                    dn = self.filter.get_value(f_iter, 0); n = dn.replace("★ ", "").replace("▶  ", "").strip()
                     if n in self.favorites: self.favorites.remove(n)
                     else: self.favorites.add(n)
                     self.save_favs(); self.update_playlist()

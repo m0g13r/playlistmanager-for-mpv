@@ -26,7 +26,7 @@ class MPVQtManager(QMainWindow):
         self.favorites = self.load_favs()
         self.sort_mode = 0
         self.current_playing_filename = ""
-        self.current_group = "All Tracks"
+        self.current_group = "All"
         self.m3u_groups = {}
         self.full_list = []
         self.group_counts = {}
@@ -176,7 +176,7 @@ class MPVQtManager(QMainWindow):
             items.append({"name": name, "filename": fname, "orig_idx": idx, "group": grp})
         def sort_priority(x):
             is_fav = x["name"] in self.favorites
-            in_group = (self.current_group == "All Tracks") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
+            in_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
             return (not in_group, not is_fav, x["name"].lower())
         full_sorted = sorted(items, key=sort_priority, reverse=(self.sort_mode == 1))
         for target_idx, item in enumerate(full_sorted):
@@ -202,7 +202,7 @@ class MPVQtManager(QMainWindow):
     def show_group_menu(self):
         menu = QMenu(self)
         fav_count = sum(1 for x in self.full_list if x["name"] in self.favorites)
-        for g_name, count in [("All Tracks", len(self.full_list)), ("★ Favorites", fav_count)]:
+        for g_name, count in [("All", len(self.full_list)), ("★ Favorites", fav_count)]:
             label = f"{g_name} ({count})"
             if self.current_group == g_name: label = f"• {label}"
             action = menu.addAction(label)
@@ -234,7 +234,7 @@ class MPVQtManager(QMainWindow):
             is_f = name in self.favorites
             if "Favorites" in self.current_group:
                 if not is_f: continue
-            elif "All Tracks" not in self.current_group:
+            elif "All" not in self.current_group:
                 if grp != self.current_group: continue
             if q and q not in name.lower(): continue
             is_playing = (fname == self.current_playing_filename)

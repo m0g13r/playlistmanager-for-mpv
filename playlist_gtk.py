@@ -64,8 +64,8 @@ class MPVGTKManager(Gtk.Window):
         self.filter = self.list_store.filter_new()
         self.filter.set_visible_func(self.filter_func)
         self.tree_view = Gtk.TreeView(model=self.filter, headers_visible=False)
-        self.tree_view.connect("row-activated", self.on_row_activated)
-        self.tree_view.connect("button-press-event", self.on_right_click)
+        self.tree_view.connect("button-release-event", self.on_click)
+        self.tree_view.connect("key-release-event", self.on_key_release)
         r_txt = Gtk.CellRendererText()
         r_txt.set_property("xpad", 8)
         r_txt.set_property("ypad", 6)
@@ -82,27 +82,11 @@ class MPVGTKManager(Gtk.Window):
         GLib.timeout_add(2000, self.update_now_playing)
     def apply_css(self):
         css = b"""
-        headerbar { 
-            min-height: 28px; 
-            padding: 0px 4px;
-        }
-        headerbar button { 
-            padding: 0px; 
-            min-width: 24px;
-            min-height: 24px;
-            margin: 2px 1px;
-        }
-        headerbar entry {
-            min-height: 22px;
-            margin: 2px 0px;
-            padding: 0px 6px;
-        }
-        treeview {
-            border-radius: 4px;
-        }
-        treeview selection {
-            border-radius: 6px;
-        }
+        headerbar { min-height: 28px; padding: 0px 4px; }
+        headerbar button { padding: 0px; min-width: 24px; min-height: 24px; margin: 2px 1px; }
+        headerbar entry { min-height: 22px; margin: 2px 0px; padding: 0px 6px; }
+        treeview { border-radius: 4px; }
+        treeview selection { border-radius: 6px; }
         """
         p = Gtk.CssProvider()
         p.load_from_data(css)
@@ -123,8 +107,7 @@ class MPVGTKManager(Gtk.Window):
             if os.path.exists(self.fav_file):
                 with open(self.fav_file, "r", encoding="utf-8") as f:
                     return set(json.load(f))
-        except:
-            pass
+        except: pass
         return set()
     def save_favs(self):
         try:
@@ -132,8 +115,7 @@ class MPVGTKManager(Gtk.Window):
                 Path(os.path.dirname(self.fav_file) or ".").mkdir(parents=True, exist_ok=True)
                 with open(self.fav_file, "w", encoding="utf-8") as f:
                     json.dump(list(self.favorites), f)
-        except:
-            pass
+        except: pass
     def send_command(self, cmd, timeout=1.0):
         c = None
         try:
@@ -144,21 +126,16 @@ class MPVGTKManager(Gtk.Window):
             res = b""
             while True:
                 chunk = c.recv(4096)
-                if not chunk:
-                    break
+                if not chunk: break
                 res += chunk
-                if res.endswith(b"\n"):
-                    break
+                if res.endswith(b"\n"): break
             return json.loads(res.decode(errors="ignore")) if res else None
-        except:
-            return None
+        except: return None
         finally:
-            if c:
-                c.close()
+            if c: c.close()
     def update_playlist(self):
         with self.update_lock:
-            if self.is_updating:
-                return
+            if self.is_updating: return
             self.is_updating = True
         threading.Thread(target=self._update_thread, daemon=True).start()
     def _update_thread(self):
@@ -166,12 +143,10 @@ class MPVGTKManager(Gtk.Window):
         path_res = self.send_command({"command": ["get_property", "path"]})
         curr_p = path_res.get("data", "") if path_res else ""
         if not res or "data" not in res:
-            with self.update_lock:
-                self.is_updating = False
+            with self.update_lock: self.is_updating = False
             return
         groups, items = set(), []
-        with self.favorites_lock:
-            fav_copy = set(self.favorites)
+        with self.favorites_lock: fav_copy = set(self.favorites)
         for idx, i in enumerate(res["data"]):
             fn = i.get("filename", "")
             name = i.get("title") or os.path.basename(fn)
@@ -196,18 +171,15 @@ class MPVGTKManager(Gtk.Window):
         self.full_list_data = full_sorted
         active_path = None
         self.current_playing_path = curr_p
-        with self.favorites_lock:
-            fav_copy = set(self.favorites)
+        with self.favorites_lock: fav_copy = set(self.favorites)
         for i in full_sorted:
             is_p = i["filename"] == curr_p
             is_f = i["name"] in fav_copy
             dn = f"★ {i['name']}" if is_f else i['name']
-            if is_p:
-                dn = f"▶ {dn}"
+            if is_p: dn = f"▶ {dn}"
             bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
             it = self.list_store.append([dn, i["orig_idx"], w, i["group"], fg, bg, i["filename"]])
-            if is_p:
-                active_path = self.list_store.get_path(it)
+            if is_p: active_path = self.list_store.get_path(it)
         self.rebuild_group_menu(groups)
         self.filter.refilter()
         if not self.resume_done and self.last_file_to_resume:
@@ -223,22 +195,16 @@ class MPVGTKManager(Gtk.Window):
                 if fp:
                     self.tree_view.get_selection().select_path(fp)
                     self.tree_view.scroll_to_cell(fp, None, True, 0.5, 0.0)
-            except:
-                pass
-        with self.update_lock:
-            self.is_updating = False
+            except: pass
+        with self.update_lock: self.is_updating = False
     def rebuild_group_menu(self, groups):
-        for c in self.group_menu.get_children():
-            self.group_menu.remove(c)
-        with self.favorites_lock:
-            fav_copy = set(self.favorites)
+        for c in self.group_menu.get_children(): self.group_menu.remove(c)
+        with self.favorites_lock: fav_copy = set(self.favorites)
         counts = {"All": len(self.full_list_data), "★ Favorites": sum(1 for x in self.full_list_data if x["name"] in fav_copy)}
-        for g in groups:
-            counts[g] = sum(1 for x in self.full_list_data if x["group"] == g)
+        for g in groups: counts[g] = sum(1 for x in self.full_list_data if x["group"] == g)
         for o in ["All", "★ Favorites"] + sorted(list(groups)):
             lbl = f"{o} ({counts.get(o, 0)})"
-            if o == self.current_group:
-                lbl = f"• {lbl}"
+            if o == self.current_group: lbl = f"• {lbl}"
             item = Gtk.MenuItem(label=lbl)
             item.connect("activate", self.on_group_selected, o)
             self.group_menu.append(item)
@@ -250,8 +216,7 @@ class MPVGTKManager(Gtk.Window):
     def update_now_playing(self):
         path_res = self.send_command({"command": ["get_property", "path"]})
         if path_res and "data" in path_res:
-            if path_res["data"] != self.current_playing_path:
-                self.update_playlist()
+            if path_res["data"] != self.current_playing_path: self.update_playlist()
         res = self.send_command({"command": ["get_property", "media-title"]})
         self.set_title(str(res.get('data')) if (res and "data" in res) else "MPV")
         return True
@@ -262,10 +227,8 @@ class MPVGTKManager(Gtk.Window):
         q = self.search_entry.get_text().lower()
         if self.current_group == "★ Favorites":
             with self.favorites_lock:
-                if name not in self.favorites:
-                    return False
-        elif self.current_group != "All" and grp != self.current_group:
-            return False
+                if name not in self.favorites: return False
+        elif self.current_group != "All" and grp != self.current_group: return False
         return q in name.lower()
     def toggle_sort(self, mi):
         self.sort_mode = 1 - self.sort_mode
@@ -273,15 +236,17 @@ class MPVGTKManager(Gtk.Window):
     def on_load_clicked(self, mi):
         diag = Gtk.FileChooserDialog(title="Playlist", parent=self, action=Gtk.FileChooserAction.OPEN)
         diag.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Open", Gtk.ResponseType.OK)
-        if diag.run() == Gtk.ResponseType.OK:
-            self.load_playlist_file(diag.get_filename())
+        if diag.run() == Gtk.ResponseType.OK: self.load_playlist_file(diag.get_filename())
         diag.destroy()
     def on_clear_clicked(self, mi):
         self.send_command({"command": ["playlist-clear"]})
         self.m3u_groups = {}
         self.update_playlist()
-    def on_right_click(self, tree, event):
-        if event.button == 3:
+    def on_click(self, tree, event):
+        if event.button == 1:
+            pi = tree.get_path_at_pos(int(event.x), int(event.y))
+            if pi: self.activate_row(pi[0])
+        elif event.button == 3:
             pi = tree.get_path_at_pos(int(event.x), int(event.y))
             if pi:
                 f_iter = self.filter.get_iter(pi[0])
@@ -289,20 +254,21 @@ class MPVGTKManager(Gtk.Window):
                     dn = self.filter.get_value(f_iter, 0)
                     n = dn.replace("★ ", "").replace("▶ ", "").strip()
                     with self.favorites_lock:
-                        if n in self.favorites:
-                            self.favorites.remove(n)
-                        else:
-                            self.favorites.add(n)
+                        if n in self.favorites: self.favorites.remove(n)
+                        else: self.favorites.add(n)
                     self.save_favs()
                     self.update_playlist()
-    def on_row_activated(self, tree, path, col):
+    def on_key_release(self, tree, event):
+        if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
+            model, iter = tree.get_selection().get_selected()
+            if iter: self.activate_row(model.get_path(iter))
+    def activate_row(self, path):
         f_iter = self.filter.get_iter(path)
         if f_iter:
             self.send_command({"command": ["set_property", "playlist-pos", self.filter.get_value(f_iter, 1)]})
             self.send_command({"command": ["set_property", "pause", False]})
     def load_playlist_file(self, path):
-        if not path or not os.path.exists(path):
-            return
+        if not path or not os.path.exists(path): return
         self.m3u_groups = {}
         try:
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -311,14 +277,11 @@ class MPVGTKManager(Gtk.Window):
                         m = re.search(r'group-title="([^"]+)"', line)
                         grp = m.group(1) if m else "Uncategorized"
                         nm = re.search(r',(.+)$', line)
-                        if nm:
-                            self.m3u_groups[nm.group(1).strip()] = grp
-        except:
-            pass
+                        if nm: self.m3u_groups[nm.group(1).strip()] = grp
+        except: pass
         self.send_command({"command": ["loadlist", path, "replace"]})
         with self.file_lock:
-            with open(self.last_m3u_file, "w", encoding="utf-8") as f:
-                json.dump({"path": path}, f)
+            with open(self.last_m3u_file, "w", encoding="utf-8") as f: json.dump({"path": path}, f)
         GLib.timeout_add(500, self.update_playlist)
     def load_window_state(self):
         try:
@@ -329,8 +292,7 @@ class MPVGTKManager(Gtk.Window):
                     self.resize(c.get("w", 150), c.get("h", 750))
                     self.last_file_to_resume = c.get("last_file", "")
                     self.current_group = c.get("current_group", "All")
-        except:
-            pass
+        except: pass
     def save_window_state_now(self):
         try:
             path_res = self.send_command({"command": ["get_property", "path"]})
@@ -338,15 +300,13 @@ class MPVGTKManager(Gtk.Window):
             with self.file_lock:
                 with open(self.config_file, "w", encoding="utf-8") as f:
                     json.dump({"x": self.get_position()[0], "y": self.get_position()[1], "w": self.get_size()[0], "h": self.get_size()[1], "last_file": curr_p, "current_group": self.current_group}, f)
-        except:
-            pass
+        except: pass
     def on_delete_event(self, w, e):
         self.save_window_state_now()
         Gtk.main_quit()
     def on_drag_data_received(self, w, c, x, y, s, i, t):
         uris = s.get_uris()
-        if uris:
-            self.load_playlist_file(GLib.filename_from_uri(uris[0])[0] if uris[0].startswith("file://") else uris[0])
+        if uris: self.load_playlist_file(GLib.filename_from_uri(uris[0])[0] if uris[0].startswith("file://") else uris[0])
         c.finish(True, False, t)
     def auto_load_last_m3u(self):
         if os.path.exists(self.last_m3u_file):
@@ -356,8 +316,7 @@ class MPVGTKManager(Gtk.Window):
                     if p:
                         self.load_playlist_file(p)
                         return False
-            except:
-                pass
+            except: pass
         self.update_playlist()
         return False
 if __name__ == "__main__":

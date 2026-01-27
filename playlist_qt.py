@@ -7,7 +7,7 @@ import re
 import threading
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QCursor
 os.environ["QT_ACCESSIBILITY"] = "0"
 class UpdateSignals(QObject):
@@ -71,7 +71,7 @@ class MPVQtManager(QMainWindow):
         self.tree_view.setModel(self.list_model)
         self.tree_view.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tree_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.tree_view.doubleClicked.connect(self.on_row_activated)
+        self.tree_view.clicked.connect(self.on_row_activated)
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.on_right_click)
         self.tree_view.setFrameShape(QFrame.NoFrame)
@@ -92,6 +92,8 @@ class MPVQtManager(QMainWindow):
             QListView::item { padding: 6px 10px; border-radius: 4px; color: #444; margin-bottom: 1px; }
             QListView::item:hover { background-color: #f5f5f5; }
             QListView::item:selected { background-color: #3584e4; color: white; }
+            QListView::item:selected:active { background-color: #3584e4; color: white; }
+            QListView::item:selected:!active { background-color: #3584e4; color: white; }
             QScrollBar:vertical { border: none; background: #fafafa; width: 8px; margin: 0; }
             QScrollBar::handle:vertical { background: #ccc; min-height: 25px; border-radius: 4px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
@@ -237,7 +239,7 @@ class MPVQtManager(QMainWindow):
     def filter_playlist(self):
         self.list_model.clear()
         q = self.search_entry.text().lower().strip()
-        scroll_to_index = None
+        scroll_index = None
         with self.lock:
             favs_copy = set(self.favorites)
         for item in self.full_list:
@@ -256,9 +258,12 @@ class MPVQtManager(QMainWindow):
             if is_playing:
                 font = QFont(); font.setBold(True); q_item.setFont(font)
                 q_item.setBackground(QColor("#3584e4")); q_item.setForeground(QColor("#ffffff"))
-                scroll_to_index = q_item.index()
             self.list_model.appendRow(q_item)
-        if scroll_to_index: self.tree_view.scrollTo(scroll_to_index, QAbstractItemView.PositionAtCenter)
+            if is_playing:
+                scroll_index = q_item.index()
+        if scroll_index:
+            self.tree_view.selectionModel().setCurrentIndex(scroll_index, QItemSelectionModel.ClearAndSelect)
+            self.tree_view.scrollTo(scroll_index, QAbstractItemView.PositionAtCenter)
     def update_now_playing(self):
         path_res = self.send_command({"command": ["get_property", "path"]})
         if path_res and "data" in path_res:

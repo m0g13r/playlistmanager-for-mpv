@@ -87,6 +87,7 @@ class MPVGTKManager(Gtk.Window):
         headerbar entry { min-height: 22px; margin: 2px 0px; padding: 0px 6px; }
         treeview { border-radius: 4px; }
         treeview selection { border-radius: 6px; }
+        scrollbar trough { background-color: @theme_base_color; border: none; }
         """
         p = Gtk.CssProvider()
         p.load_from_data(css)
@@ -169,7 +170,7 @@ class MPVGTKManager(Gtk.Window):
     def _finalize_update(self, groups, full_sorted, curr_p):
         self.list_store.clear()
         self.full_list_data = full_sorted
-        active_path = None
+        active_iter = None
         self.current_playing_path = curr_p
         with self.favorites_lock: fav_copy = set(self.favorites)
         for i in full_sorted:
@@ -179,9 +180,14 @@ class MPVGTKManager(Gtk.Window):
             if is_p: dn = f"▶ {dn}"
             bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
             it = self.list_store.append([dn, i["orig_idx"], w, i["group"], fg, bg, i["filename"]])
-            if is_p: active_path = self.list_store.get_path(it)
+            if is_p: active_iter = it
         self.rebuild_group_menu(groups)
         self.filter.refilter()
+        if active_iter:
+            f_path = self.filter.convert_child_path_to_path(self.list_store.get_path(active_iter))
+            if f_path:
+                self.tree_view.get_selection().select_path(f_path)
+                self.tree_view.scroll_to_cell(f_path, None, True, 0.5, 0.0)
         if not self.resume_done and self.last_file_to_resume:
             for i in full_sorted:
                 if i["filename"] == self.last_file_to_resume:
@@ -189,13 +195,6 @@ class MPVGTKManager(Gtk.Window):
                     self.send_command({"command": ["set_property", "pause", True]})
                     self.resume_done = True
                     break
-        if active_path:
-            try:
-                fp = self.filter.convert_child_path_to_path(active_path)
-                if fp:
-                    self.tree_view.get_selection().select_path(fp)
-                    self.tree_view.scroll_to_cell(fp, None, True, 0.5, 0.0)
-            except: pass
         with self.update_lock: self.is_updating = False
     def rebuild_group_menu(self, groups):
         for c in self.group_menu.get_children(): self.group_menu.remove(c)

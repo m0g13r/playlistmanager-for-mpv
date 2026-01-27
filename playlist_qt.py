@@ -96,6 +96,8 @@ class MPVQtManager(QMainWindow):
             QListView::item:selected:!active { background-color: #3584e4; color: white; }
             QScrollBar:vertical { border: none; background: #fafafa; width: 8px; margin: 0; }
             QScrollBar::handle:vertical { background: #ccc; min-height: 25px; border-radius: 4px; }
+            QScrollBar::handle:vertical:hover { background: #3584e4; }
+            QScrollBar::handle:vertical:pressed { background: #2a69b7; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
             QMenu { background-color: white; border: 1px solid #ddd; border-radius: 6px; padding: 4px; font-size: 13px; }
             QMenu::item { padding: 4px 16px; border-radius: 3px; }

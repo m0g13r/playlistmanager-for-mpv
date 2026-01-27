@@ -18,19 +18,21 @@ class MPVGTKManager(Gtk.Window):
         self.last_m3u_file = os.path.expanduser("~/.mpv_last_playlist.json")
         self.config_file = os.path.expanduser("~/.mpv_gtk_config.json")
         self.favorites = self.load_favs()
-        self.favorites_lock = threading.Lock()
         self.file_lock = threading.Lock()
         self.update_lock = threading.Lock()
+        self.favorites_lock = threading.Lock()
         self.sort_mode = 0
         self.current_playing_path = ""
         self.current_group = "All"
         self.m3u_groups = {}
         self.full_list_data = []
         self.is_updating = False
+        self.resume_done = False
+        self.last_file_path = ""
         self.apply_css()
         self.ensure_mpv_running()
         self.set_default_size(200, 750)
-        self.set_size_request(100, -1)
+        self.set_size_request(50, -1)
         self.load_window_state()
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
@@ -112,20 +114,15 @@ class MPVGTKManager(Gtk.Window):
         .fab-small { min-width: 24px; min-height: 24px; background: rgba(60, 60, 60, 0.6); color: white; } 
         .fab-small:hover { background: rgba(80, 80, 80, 0.8); }
         treeview { background-color: transparent; }
-        treeview:selected { border-radius: 6px; background-color: #3584e4; color: white; }
+        treeview selection { border-radius: 8px; }
+        treeview:selected { border-radius: 8px; background-color: #3584e4; color: white; }
         """
         p = Gtk.CssProvider()
         p.load_from_data(css)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     def ensure_mpv_running(self):
-        try:
-            if os.path.exists(self.socket_path):
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                s.settimeout(0.2)
-                s.connect(self.socket_path)
-                s.close()
-            else: raise FileNotFoundError
-        except: subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not os.path.exists(self.socket_path):
+            subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     def load_favs(self):
         try:
             if os.path.exists(self.fav_file):
@@ -133,28 +130,25 @@ class MPVGTKManager(Gtk.Window):
         except: pass
         return set()
     def save_favs(self):
+        with self.file_lock:
+            Path(os.path.dirname(self.fav_file) or ".").mkdir(parents=True, exist_ok=True)
+            with open(self.fav_file, "w", encoding="utf-8") as f: json.dump(list(self.favorites), f)
+    def send_command(self, cmd):
         try:
-            with self.file_lock:
-                Path(os.path.dirname(self.fav_file) or ".").mkdir(parents=True, exist_ok=True)
-                with open(self.fav_file, "w", encoding="utf-8") as f: json.dump(list(self.favorites), f)
-        except: pass
-    def send_command(self, cmd, timeout=1.0):
-        c = None
-        try:
-            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            c.settimeout(timeout)
-            c.connect(self.socket_path)
-            c.sendall(json.dumps(cmd).encode() + b"\n")
-            res = b""
-            while True:
-                chunk = c.recv(4096)
-                if not chunk: break
-                res += chunk
-                if res.endswith(b"\n"): break
-            return json.loads(res.decode(errors="ignore")) if res else None
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(1.0)
+                c.connect(self.socket_path)
+                c.sendall(json.dumps(cmd).encode() + b"\n")
+                res = b""
+                while True:
+                    chunk = c.recv(8192)
+                    if not chunk: break
+                    res += chunk
+                    if res.endswith(b"\n"): break
+                if res:
+                    line = res.decode(errors="ignore").splitlines()[0]
+                    return json.loads(line)
         except: return None
-        finally:
-            if c: c.close()
     def update_playlist(self):
         with self.update_lock:
             if self.is_updating: return
@@ -184,7 +178,8 @@ class MPVGTKManager(Gtk.Window):
             if item["orig_idx"] != target_idx:
                 self.send_command({"command": ["playlist-move", item["orig_idx"], target_idx]})
                 for other in items:
-                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx: other["orig_idx"] += 1
+                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx:
+                        other["orig_idx"] += 1
                 item["orig_idx"] = target_idx
         GLib.idle_add(self._finalize_update, groups, full_sorted, curr_p)
     def _finalize_update(self, groups, full_sorted, curr_p):
@@ -208,6 +203,13 @@ class MPVGTKManager(Gtk.Window):
             if f_path:
                 self.tree_view.get_selection().select_path(f_path)
                 self.tree_view.scroll_to_cell(f_path, None, True, 0.5, 0.0)
+        if not self.resume_done and self.last_file_path:
+            for i in full_sorted:
+                if i["filename"] == self.last_file_path:
+                    self.send_command({"command": ["set_property", "playlist-pos", i["orig_idx"]]})
+                    self.send_command({"command": ["set_property", "pause", True]})
+                    self.resume_done = True
+                    break
         with self.update_lock: self.is_updating = False
     def rebuild_group_menu(self, groups):
         for c in self.group_menu.get_children(): self.group_menu.remove(c)
@@ -228,7 +230,9 @@ class MPVGTKManager(Gtk.Window):
     def update_now_playing(self):
         path_res = self.send_command({"command": ["get_property", "path"]})
         if path_res and "data" in path_res:
-            if path_res["data"] != self.current_playing_path: self.update_playlist()
+            if path_res["data"] != self.current_playing_path: 
+                self.current_playing_path = path_res["data"]
+                self.update_playlist()
         res = self.send_command({"command": ["get_property", "media-title"]})
         self.set_title(str(res.get('data')) if (res and "data" in res) else "MPV")
         return True
@@ -238,8 +242,7 @@ class MPVGTKManager(Gtk.Window):
         grp = model.get_value(iter, 3)
         q = self.search_entry.get_text().lower()
         if self.current_group == "★ Favorites":
-            with self.favorites_lock:
-                if name not in self.favorites: return False
+            with self.favorites_lock: return name in self.favorites and q in name.lower()
         elif self.current_group != "All" and grp != self.current_group: return False
         return q in name.lower()
     def toggle_sort(self, mi):
@@ -255,25 +258,23 @@ class MPVGTKManager(Gtk.Window):
         self.m3u_groups = {}
         self.update_playlist()
     def on_click(self, tree, event):
-        if event.button == 1:
-            pi = tree.get_path_at_pos(int(event.x), int(event.y))
-            if pi: self.activate_row(pi[0])
+        pi = tree.get_path_at_pos(int(event.x), int(event.y))
+        if not pi: return
+        if event.button == 1: self.activate_row(pi[0])
         elif event.button == 3:
-            pi = tree.get_path_at_pos(int(event.x), int(event.y))
-            if pi:
-                f_iter = self.filter.get_iter(pi[0])
-                if f_iter:
-                    dn = self.filter.get_value(f_iter, 0)
-                    n = dn.replace("★ ", "").replace("▶ ", "").strip()
-                    with self.favorites_lock:
-                        if n in self.favorites: self.favorites.remove(n)
-                        else: self.favorites.add(n)
-                    self.save_favs()
-                    self.update_playlist()
+            f_iter = self.filter.get_iter(pi[0])
+            if f_iter:
+                dn = self.filter.get_value(f_iter, 0)
+                n = dn.replace("★ ", "").replace("▶ ", "").strip()
+                with self.favorites_lock:
+                    if n in self.favorites: self.favorites.remove(n)
+                    else: self.favorites.add(n)
+                self.save_favs()
+                self.update_playlist()
     def on_key_release(self, tree, event):
         if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
-            model, iter = tree.get_selection().get_selected()
-            if iter: self.activate_row(model.get_path(iter))
+            model, it = tree.get_selection().get_selected()
+            if it: self.activate_row(model.get_path(it))
     def activate_row(self, path):
         f_iter = self.filter.get_iter(path)
         if f_iter:
@@ -285,7 +286,7 @@ class MPVGTKManager(Gtk.Window):
         try:
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
-                    if line.startswith("#EXTINF"):
+                    if line.strip().startswith("#EXTINF"):
                         m = re.search(r'group-title="([^"]+)"', line)
                         grp = m.group(1) if m else "Uncategorized"
                         nm = re.search(r',(.+)$', line)
@@ -301,16 +302,19 @@ class MPVGTKManager(Gtk.Window):
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     c = json.load(f)
                     self.move(c.get("x", 100), c.get("y", 100))
-                    self.resize(c.get("w", 150), c.get("h", 750))
+                    self.resize(c.get("w", 200), c.get("h", 750))
                     self.current_group = c.get("current_group", "All")
+                    self.last_file_path = c.get("last_playing", "")
         except: pass
     def save_window_state_now(self):
         try:
+            path_res = self.send_command({"command": ["get_property", "path"]})
+            curr = path_res.get("data", "") if path_res else ""
+            pos = self.get_position()
+            size = self.get_size()
             with self.file_lock:
                 with open(self.config_file, "w", encoding="utf-8") as f:
-                    json.dump({"x": self.get_position()[0], "y": self.get_position()[1],
-                               "w": self.get_size()[0], "h": self.get_size()[1],
-                               "current_group": self.current_group}, f)
+                    json.dump({"x": pos[0], "y": pos[1], "w": size[0], "h": size[1], "current_group": self.current_group, "last_playing": curr}, f)
         except: pass
     def on_delete_event(self, w, e):
         self.save_window_state_now()
@@ -324,11 +328,8 @@ class MPVGTKManager(Gtk.Window):
             try:
                 with open(self.last_m3u_file, "r", encoding="utf-8") as f:
                     p = json.load(f).get("path")
-                    if p:
-                        self.load_playlist_file(p)
-                        return False
+                    if p: self.load_playlist_file(p)
             except: pass
-        self.update_playlist()
         return False
 if __name__ == "__main__":
     win = MPVGTKManager()

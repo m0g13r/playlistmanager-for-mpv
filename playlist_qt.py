@@ -100,20 +100,21 @@ class MPVQtManager(QMainWindow):
         self.setStyleSheet("""
             QMainWindow { background-color: #ffffff; }
             * { outline: none; }
+            QPushButton { border: none; background-color: #f2f2f2; border-radius: 4px; color: #333; }
+            QPushButton:hover { background-color: #e5e5e5; }
+            QPushButton:focus { outline: none; border: none; }
             QLineEdit { padding: 4px 10px; border: 1px solid #eee; border-radius: 5px; background: #f9f9f9; }
-            QPushButton#fab-trigger { border-radius: 16px; background-color: rgba(53, 132, 228, 180); color: white; font-size: 16px; border: none; }
+            QPushButton#fab-trigger { border-radius: 16px; background-color: rgba(53, 132, 228, 180); color: white; font-size: 16px; }
             QPushButton#fab-trigger:hover { background-color: #3584e4; }
-            QPushButton#fab-small { border-radius: 14px; background-color: rgba(60, 60, 60, 160); color: white; font-size: 12px; border: none; }
+            QPushButton#fab-small { border-radius: 14px; background-color: rgba(60, 60, 60, 160); color: white; font-size: 12px; }
             QPushButton#fab-small:hover { background-color: #444; }
-            QListView { background-color: white; }
+            QListView { background-color: white; border: none; }
             QListView::item { padding: 6px 10px; border-radius: 8px; margin-bottom: 2px; border: none; }
             QListView::item:selected { background-color: #3584e4; color: white; }
             QScrollBar:vertical { border: none; background: #f8f8f8; width: 8px; margin: 0; }
             QScrollBar::handle:vertical { background: #ccc; min-height: 30px; border-radius: 4px; }
             QScrollBar::handle:vertical:hover { background: #3584e4; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; background: none; }
-            QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical { background: none; }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+            QScrollBar::add-line, QScrollBar::sub-line { height: 0px; }
         """)
     def toggle_fab(self):
         self.sub_buttons.setVisible(not self.sub_buttons.isVisible())
@@ -123,7 +124,6 @@ class MPVQtManager(QMainWindow):
         self.update_fab_pos()
     def update_fab_pos(self):
         self.fab_container.adjustSize()
-        # Hier habe ich den Randabstand auf 25px erhöht
         self.fab_container.move(self.width() - self.fab_container.width() - 25, self.height() - self.fab_container.height() - 25)
     def ensure_mpv_running(self):
         try:
@@ -161,17 +161,17 @@ class MPVQtManager(QMainWindow):
             except: pass
     def closeEvent(self, event):
         self.save_config(); super().closeEvent(event)
-    def send_command(self, cmd, timeout=0.5):
+    def send_command(self, cmd, timeout=1.0):
         client = None
         try:
             client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); client.settimeout(timeout); client.connect(self.socket_path); client.sendall(json.dumps(cmd).encode() + b"\n")
             res = b""
             while True:
-                chunk = client.recv(4096)
+                chunk = client.recv(8192)
                 if not chunk: break
                 res += chunk
-                if res.endswith(b"\n"): break
-            return json.loads(res.decode(errors="ignore"))
+                if b"\n" in res: break
+            return json.loads(res.decode(errors="ignore").splitlines()[0])
         except: return None
         finally:
             if client: client.close()
@@ -187,7 +187,14 @@ class MPVQtManager(QMainWindow):
             fn = i.get("filename", ""); nm = i.get("title") or os.path.basename(fn); grp = self.m3u_groups.get(nm, "Uncategorized"); g_counts[grp] = g_counts.get(grp, 0) + 1; items.append({"name": nm, "filename": fn, "orig_idx": idx, "group": grp})
         def sort_priority(x):
             is_f = x["name"] in favs_copy; in_g = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_f) or (x["group"] == self.current_group); return (not in_g, not is_f, x["name"].lower())
-        self.signals.finished.emit(g_counts, sorted(items, key=sort_priority, reverse=(self.sort_mode == 1)), curr_path)
+        full_sorted = sorted(items, key=sort_priority, reverse=(self.sort_mode == 1))
+        for target_idx, item in enumerate(full_sorted):
+            if item["orig_idx"] != target_idx:
+                self.send_command({"command": ["playlist-move", item["orig_idx"], target_idx]})
+                for other in items:
+                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx: other["orig_idx"] += 1
+                item["orig_idx"] = target_idx
+        self.signals.finished.emit(g_counts, full_sorted, curr_path)
     def _finalize_update(self, group_counts, full_sorted, curr_path):
         self.full_list, self.group_counts, self.current_playing_filename = full_sorted, group_counts, curr_path or ""; self.filter_playlist()
         if not self.resume_done and self.last_file:
@@ -271,7 +278,7 @@ class MPVQtManager(QMainWindow):
         if idx.isValid():
             item = self.list_model.itemFromIndex(idx)
             if item:
-                name = item.text().replace("★ ", "").replace("▶  ", "").replace("• ", "")
+                name = item.text().replace("★ ", "").replace("▶  ", "").replace("• ", "").strip()
                 with self.lock:
                     if name in self.favorites: self.favorites.remove(name)
                     else: self.favorites.add(name)

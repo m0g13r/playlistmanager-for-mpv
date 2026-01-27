@@ -23,8 +23,6 @@ class MPVGTKManager(Gtk.Window):
         self.update_lock = threading.Lock()
         self.sort_mode = 0
         self.current_playing_path = ""
-        self.last_file_to_resume = ""
-        self.resume_done = False
         self.current_group = "All"
         self.m3u_groups = {}
         self.full_list_data = []
@@ -37,6 +35,7 @@ class MPVGTKManager(Gtk.Window):
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
         hb.set_decoration_layout("menu:close")
+        hb.get_style_context().add_class("compact-header")
         self.set_titlebar(hb)
         self.search_entry = Gtk.SearchEntry(placeholder_text="Search...")
         self.search_entry.set_width_chars(1)
@@ -56,10 +55,10 @@ class MPVGTKManager(Gtk.Window):
         self.group_menu = Gtk.Menu()
         self.group_button.set_popup(self.group_menu)
         hb.pack_end(self.group_button)
-        self.vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.add(self.vbox)
+        self.overlay = Gtk.Overlay()
+        self.add(self.overlay)
         self.scrolled = Gtk.ScrolledWindow()
-        self.vbox.pack_start(self.scrolled, True, True, 0)
+        self.overlay.add(self.scrolled)
         self.list_store = Gtk.ListStore(str, int, int, str, str, str, str)
         self.filter = self.list_store.filter_new()
         self.filter.set_visible_func(self.filter_func)
@@ -73,6 +72,28 @@ class MPVGTKManager(Gtk.Window):
         col = Gtk.TreeViewColumn("Name", r_txt, text=0, weight=2, foreground=4, background=5)
         self.tree_view.append_column(col)
         self.scrolled.add(self.tree_view)
+        self.fab_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.fab_container.set_halign(Gtk.Align.END)
+        self.fab_container.set_valign(Gtk.Align.END)
+        self.fab_container.set_margin_bottom(25)
+        self.fab_container.set_margin_right(25)
+        self.revealer = Gtk.Revealer()
+        self.revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_UP)
+        sub_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        for icon, cmd in [("media-skip-forward-symbolic", ["playlist-next"]), ("media-playback-start-symbolic", ["cycle", "pause"]), ("media-skip-backward-symbolic", ["playlist-prev"])]:
+            btn = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.MENU)
+            btn.get_style_context().add_class("fab-button")
+            btn.get_style_context().add_class("fab-small")
+            btn.connect("clicked", lambda w, c=cmd: (self.send_command({"command": c}), self.revealer.set_reveal_child(False)))
+            sub_box.pack_start(btn, False, False, 0)
+        self.revealer.add(sub_box)
+        self.fab_container.pack_start(self.revealer, False, False, 0)
+        self.main_fab = Gtk.Button.new_from_icon_name("view-more-horizontal-symbolic", Gtk.IconSize.MENU)
+        self.main_fab.get_style_context().add_class("fab-button")
+        self.main_fab.get_style_context().add_class("fab-trigger")
+        self.main_fab.connect("clicked", lambda w: self.revealer.set_reveal_child(not self.revealer.get_reveal_child()))
+        self.fab_container.pack_start(self.main_fab, False, False, 0)
+        self.overlay.add_overlay(self.fab_container)
         self.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
         self.drag_dest_add_uri_targets()
         self.connect("drag-data-received", self.on_drag_data_received)
@@ -82,12 +103,16 @@ class MPVGTKManager(Gtk.Window):
         GLib.timeout_add(2000, self.update_now_playing)
     def apply_css(self):
         css = b"""
-        headerbar { min-height: 28px; padding: 0px 4px; }
-        headerbar button { padding: 0px; min-width: 24px; min-height: 24px; margin: 2px 1px; }
-        headerbar entry { min-height: 22px; margin: 2px 0px; padding: 0px 6px; }
-        treeview { border-radius: 4px; }
-        treeview selection { border-radius: 6px; }
-        scrollbar trough { background-color: @theme_base_color; border: none; }
+        .compact-header { min-height: 24px; padding: 0; }
+        .compact-header button { padding: 1px 2px; min-height: 20px; min-width: 20px; }
+        .compact-header entry { min-height: 20px; margin: 2px 0; }
+        .fab-button { border-radius: 50%; border: none; padding: 0; transition: all 150ms ease; box-shadow: none; } 
+        .fab-trigger { min-width: 30px; min-height: 30px; background: rgba(53, 132, 228, 0.7); color: white; } 
+        .fab-trigger:hover { background: rgba(53, 132, 228, 0.9); } 
+        .fab-small { min-width: 24px; min-height: 24px; background: rgba(60, 60, 60, 0.6); color: white; } 
+        .fab-small:hover { background: rgba(80, 80, 80, 0.8); }
+        treeview { background-color: transparent; }
+        treeview:selected { border-radius: 6px; background-color: #3584e4; color: white; }
         """
         p = Gtk.CssProvider()
         p.load_from_data(css)
@@ -99,23 +124,19 @@ class MPVGTKManager(Gtk.Window):
                 s.settimeout(0.2)
                 s.connect(self.socket_path)
                 s.close()
-            else:
-                raise FileNotFoundError
-        except:
-            subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else: raise FileNotFoundError
+        except: subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     def load_favs(self):
         try:
             if os.path.exists(self.fav_file):
-                with open(self.fav_file, "r", encoding="utf-8") as f:
-                    return set(json.load(f))
+                with open(self.fav_file, "r", encoding="utf-8") as f: return set(json.load(f))
         except: pass
         return set()
     def save_favs(self):
         try:
             with self.file_lock:
                 Path(os.path.dirname(self.fav_file) or ".").mkdir(parents=True, exist_ok=True)
-                with open(self.fav_file, "w", encoding="utf-8") as f:
-                    json.dump(list(self.favorites), f)
+                with open(self.fav_file, "w", encoding="utf-8") as f: json.dump(list(self.favorites), f)
         except: pass
     def send_command(self, cmd, timeout=1.0):
         c = None
@@ -163,8 +184,7 @@ class MPVGTKManager(Gtk.Window):
             if item["orig_idx"] != target_idx:
                 self.send_command({"command": ["playlist-move", item["orig_idx"], target_idx]})
                 for other in items:
-                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx:
-                        other["orig_idx"] += 1
+                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx: other["orig_idx"] += 1
                 item["orig_idx"] = target_idx
         GLib.idle_add(self._finalize_update, groups, full_sorted, curr_p)
     def _finalize_update(self, groups, full_sorted, curr_p):
@@ -188,13 +208,6 @@ class MPVGTKManager(Gtk.Window):
             if f_path:
                 self.tree_view.get_selection().select_path(f_path)
                 self.tree_view.scroll_to_cell(f_path, None, True, 0.5, 0.0)
-        if not self.resume_done and self.last_file_to_resume:
-            for i in full_sorted:
-                if i["filename"] == self.last_file_to_resume:
-                    self.send_command({"command": ["set_property", "playlist-pos", i["orig_idx"]]})
-                    self.send_command({"command": ["set_property", "pause", True]})
-                    self.resume_done = True
-                    break
         with self.update_lock: self.is_updating = False
     def rebuild_group_menu(self, groups):
         for c in self.group_menu.get_children(): self.group_menu.remove(c)
@@ -289,16 +302,15 @@ class MPVGTKManager(Gtk.Window):
                     c = json.load(f)
                     self.move(c.get("x", 100), c.get("y", 100))
                     self.resize(c.get("w", 150), c.get("h", 750))
-                    self.last_file_to_resume = c.get("last_file", "")
                     self.current_group = c.get("current_group", "All")
         except: pass
     def save_window_state_now(self):
         try:
-            path_res = self.send_command({"command": ["get_property", "path"]})
-            curr_p = path_res.get("data", "") if path_res else ""
             with self.file_lock:
                 with open(self.config_file, "w", encoding="utf-8") as f:
-                    json.dump({"x": self.get_position()[0], "y": self.get_position()[1], "w": self.get_size()[0], "h": self.get_size()[1], "last_file": curr_p, "current_group": self.current_group}, f)
+                    json.dump({"x": self.get_position()[0], "y": self.get_position()[1],
+                               "w": self.get_size()[0], "h": self.get_size()[1],
+                               "current_group": self.current_group}, f)
         except: pass
     def on_delete_event(self, w, e):
         self.save_window_state_now()

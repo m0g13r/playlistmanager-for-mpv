@@ -43,19 +43,21 @@ class MPVQtManager(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         self.vbox = QVBoxLayout(central)
-        self.vbox.setSpacing(10)
-        self.vbox.setContentsMargins(10, 10, 10, 10)
+        self.vbox.setSpacing(4)
+        self.vbox.setContentsMargins(5, 5, 5, 5)
         self.header = QHBoxLayout()
-        self.header.setSpacing(5)
+        self.header.setSpacing(4)
+        self.header.setContentsMargins(0, 0, 0, 0)
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Search...")
+        self.search_entry.setFixedHeight(28)
         self.search_entry.textChanged.connect(self.filter_playlist)
         self.group_btn = QPushButton("▾")
-        self.group_btn.setFixedSize(35, 35)
+        self.group_btn.setFixedSize(28, 28)
         self.group_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.group_btn.clicked.connect(self.show_group_menu)
         self.burger_btn = QPushButton("≡")
-        self.burger_btn.setFixedSize(35, 35)
+        self.burger_btn.setFixedSize(28, 28)
         self.burger_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.burger_btn.clicked.connect(self.show_burger_menu)
         self.header.addWidget(self.search_entry)
@@ -78,26 +80,23 @@ class MPVQtManager(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_now_playing)
         self.timer.start(2000)
-        self.resize(320, 750)
+        self.resize(280, 750)
     def apply_styles(self):
         self.setStyleSheet("""
             QMainWindow { background-color: #ffffff; }
-            QLineEdit { padding: 8px 12px; border: 1px solid #eee; border-radius: 6px; background: #f9f9f9; font-size: 13px; }
+            QLineEdit { padding: 4px 10px; border: 1px solid #eee; border-radius: 5px; background: #f9f9f9; font-size: 13px; }
             QLineEdit:focus { border: 1px solid #3584e4; background: white; }
-            QPushButton { border-radius: 6px; background-color: #f5f5f5; color: #444; border: none; font-weight: bold; }
+            QPushButton { border-radius: 5px; background-color: #f5f5f5; color: #444; border: none; font-weight: bold; font-size: 14px; }
             QPushButton:hover { background-color: #ececec; }
-            QListView { background-color: white; border-radius: 6px; font-size: 13px; outline: none; padding: 2px; }
-            QListView::item { padding: 10px; border-radius: 4px; color: #555; margin-bottom: 1px; }
-            QListView::item:hover { background-color: #f8f9fa; }
+            QListView { background-color: white; border-radius: 6px; font-size: 13px; outline: none; padding: 0px; }
+            QListView::item { padding: 6px 10px; border-radius: 4px; color: #444; margin-bottom: 1px; }
+            QListView::item:hover { background-color: #f5f5f5; }
             QListView::item:selected { background-color: #3584e4; color: white; }
-            QScrollBar:vertical { border: none; background: #fafafa; width: 10px; margin: 0; border-radius: 5px; }
-            QScrollBar::handle:vertical { background: #ddd; min-height: 30px; border-radius: 5px; }
-            QScrollBar::handle:vertical:hover { background: #3584e4; }
-            QScrollBar::handle:vertical:pressed { background: #1a5fb4; }
+            QScrollBar:vertical { border: none; background: #fafafa; width: 8px; margin: 0; }
+            QScrollBar::handle:vertical { background: #ccc; min-height: 25px; border-radius: 4px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-            QMenu { background-color: white; border: 1px solid #eee; border-radius: 6px; padding: 4px; }
-            QMenu::item { padding: 6px 20px; border-radius: 3px; }
+            QMenu { background-color: white; border: 1px solid #ddd; border-radius: 6px; padding: 4px; font-size: 13px; }
+            QMenu::item { padding: 4px 16px; border-radius: 3px; }
             QMenu::item:selected { background-color: #3584e4; color: white; }
         """)
     def ensure_mpv_running(self):
@@ -131,7 +130,7 @@ class MPVQtManager(QMainWindow):
                     with open(self.config_file, "r", encoding="utf-8") as f:
                         c = json.load(f)
                         self.move(c.get("x", 100), c.get("y", 100))
-                        self.resize(c.get("w", 320), c.get("h", 750))
+                        self.resize(c.get("w", 280), c.get("h", 750))
                         self.last_file = c.get("last_file", "")
                         self.current_group = c.get("current_group", "All")
             except Exception: pass

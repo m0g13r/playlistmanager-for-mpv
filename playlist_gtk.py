@@ -31,21 +31,21 @@ class MPVGTKManager(Gtk.Window):
         self.is_updating = False
         self.apply_css()
         self.ensure_mpv_running()
-        self.set_default_size(280, 750)
-        self.set_size_request(200, -1)
+        self.set_default_size(200, 750)
+        self.set_size_request(100, -1)
         self.load_window_state()
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
         hb.set_decoration_layout("menu:close")
         self.set_titlebar(hb)
         self.search_entry = Gtk.SearchEntry(placeholder_text="Search...")
+        self.search_entry.set_width_chars(1)
         self.search_entry.set_hexpand(True)
         self.search_entry.connect("changed", lambda w: self.filter.refilter())
         hb.set_custom_title(self.search_entry)
         self.menu_button = Gtk.MenuButton(label="≡")
         self.main_menu = Gtk.Menu()
-        for l, cb in [("Open Playlist", self.on_load_clicked), ("Toggle Sort", self.toggle_sort), 
-                       ("Refresh", lambda x: self.update_playlist()), ("Clear Playlist", self.on_clear_clicked)]:
+        for l, cb in [("Open Playlist", self.on_load_clicked), ("Toggle Sort", self.toggle_sort), ("Refresh", lambda x: self.update_playlist()), ("Clear Playlist", self.on_clear_clicked)]:
             mi = Gtk.MenuItem(label=l)
             mi.connect("activate", cb)
             self.main_menu.append(mi)
@@ -67,8 +67,8 @@ class MPVGTKManager(Gtk.Window):
         self.tree_view.connect("row-activated", self.on_row_activated)
         self.tree_view.connect("button-press-event", self.on_right_click)
         r_txt = Gtk.CellRendererText()
-        r_txt.set_property("xpad", 10)
-        r_txt.set_property("ypad", 8)
+        r_txt.set_property("xpad", 8)
+        r_txt.set_property("ypad", 6)
         r_txt.set_property("ellipsize", 3)
         col = Gtk.TreeViewColumn("Name", r_txt, text=0, weight=2, foreground=4, background=5)
         self.tree_view.append_column(col)
@@ -81,7 +81,29 @@ class MPVGTKManager(Gtk.Window):
         GLib.idle_add(self.auto_load_last_m3u)
         GLib.timeout_add(2000, self.update_now_playing)
     def apply_css(self):
-        css = b"treeview { background-color: white; border-radius: 6px; } treeview:selected { background-color: #3584e4; color: white; border-radius: 4px; } treeview row:hover { background-color: #f8f9fa; } scrolledwindow { border: none; } button { font-weight: bold; padding: 0 6px; border-radius: 6px; }"
+        css = b"""
+        headerbar { 
+            min-height: 28px; 
+            padding: 0px 4px;
+        }
+        headerbar button { 
+            padding: 0px; 
+            min-width: 24px;
+            min-height: 24px;
+            margin: 2px 1px;
+        }
+        headerbar entry {
+            min-height: 22px;
+            margin: 2px 0px;
+            padding: 0px 6px;
+        }
+        treeview {
+            border-radius: 4px;
+        }
+        treeview selection {
+            border-radius: 6px;
+        }
+        """
         p = Gtk.CssProvider()
         p.load_from_data(css)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -181,7 +203,7 @@ class MPVGTKManager(Gtk.Window):
             is_f = i["name"] in fav_copy
             dn = f"★ {i['name']}" if is_f else i['name']
             if is_p:
-                dn = f"▶  {dn}"
+                dn = f"▶ {dn}"
             bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
             it = self.list_store.append([dn, i["orig_idx"], w, i["group"], fg, bg, i["filename"]])
             if is_p:
@@ -235,7 +257,7 @@ class MPVGTKManager(Gtk.Window):
         return True
     def filter_func(self, model, iter, data):
         dn = model.get_value(iter, 0)
-        name = dn.replace("★ ", "").replace("▶  ", "")
+        name = dn.replace("★ ", "").replace("▶ ", "")
         grp = model.get_value(iter, 3)
         q = self.search_entry.get_text().lower()
         if self.current_group == "★ Favorites":
@@ -265,7 +287,7 @@ class MPVGTKManager(Gtk.Window):
                 f_iter = self.filter.get_iter(pi[0])
                 if f_iter:
                     dn = self.filter.get_value(f_iter, 0)
-                    n = dn.replace("★ ", "").replace("▶  ", "").strip()
+                    n = dn.replace("★ ", "").replace("▶ ", "").strip()
                     with self.favorites_lock:
                         if n in self.favorites:
                             self.favorites.remove(n)
@@ -304,7 +326,7 @@ class MPVGTKManager(Gtk.Window):
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     c = json.load(f)
                     self.move(c.get("x", 100), c.get("y", 100))
-                    self.resize(c.get("w", 280), c.get("h", 750))
+                    self.resize(c.get("w", 150), c.get("h", 750))
                     self.last_file_to_resume = c.get("last_file", "")
                     self.current_group = c.get("current_group", "All")
         except:
@@ -315,9 +337,7 @@ class MPVGTKManager(Gtk.Window):
             curr_p = path_res.get("data", "") if path_res else ""
             with self.file_lock:
                 with open(self.config_file, "w", encoding="utf-8") as f:
-                    json.dump({"x": self.get_position()[0], "y": self.get_position()[1], 
-                               "w": self.get_size()[0], "h": self.get_size()[1], 
-                               "last_file": curr_p, "current_group": self.current_group}, f)
+                    json.dump({"x": self.get_position()[0], "y": self.get_position()[1], "w": self.get_size()[0], "h": self.get_size()[1], "last_file": curr_p, "current_group": self.current_group}, f)
         except:
             pass
     def on_delete_event(self, w, e):

@@ -1,4 +1,4 @@
-# playlistmanager-for-mpv
+# playlistmanager for mpv
 a python playlistmanager for MPV
 
 it uses ipc socket

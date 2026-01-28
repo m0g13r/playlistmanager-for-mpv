@@ -6,7 +6,7 @@ import subprocess
 import re
 import threading
 from pathlib import Path
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QCursor
 os.environ["QT_ACCESSIBILITY"] = "0"
@@ -61,6 +61,8 @@ class MPVQtManager(QMainWindow):
         self.vbox.addLayout(self.header)
         self.tree_view = QListView()
         self.tree_view.setFrameShape(QFrame.NoFrame)
+        self.tree_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.tree_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.list_model = QStandardItemModel()
         self.tree_view.setModel(self.list_model)
         self.tree_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -73,11 +75,17 @@ class MPVQtManager(QMainWindow):
         self.sub_layout = QVBoxLayout(self.sub_buttons)
         self.sub_layout.setContentsMargins(0, 0, 0, 0)
         self.sub_layout.setSpacing(6)
+        self.vol_slider = QSlider(Qt.Vertical)
+        self.vol_slider.setRange(0, 130)
+        self.vol_slider.setFixedSize(28, 120)
+        self.vol_slider.setObjectName("fab-vol")
+        self.vol_slider.valueChanged.connect(self.on_vol_changed)
+        self.sub_layout.addWidget(self.vol_slider)
         for icon, cmd in [("⏭", ["playlist-next"]), ("⏯", ["cycle", "pause"]), ("⏮", ["playlist-prev"])]:
             btn = QPushButton(icon)
             btn.setObjectName("fab-small")
             btn.setFixedSize(28, 28)
-            btn.clicked.connect(lambda checked=False, c=cmd: (self.send_command({"command": c}), self.toggle_fab()))
+            btn.clicked.connect(lambda checked=False, c=cmd: self.send_command({"command": c}))
             self.sub_layout.addWidget(btn)
         self.sub_buttons.setVisible(False)
         self.main_fab = QPushButton("⋮")
@@ -100,39 +108,52 @@ class MPVQtManager(QMainWindow):
         self.setStyleSheet("""
             QMainWindow { background-color: #ffffff; }
             * { outline: none; }
-            QPushButton { border: none; background-color: #f2f2f2; border-radius: 4px; color: #333; }
+            QPushButton { border: none; background-color: #f2f2f2; border-radius: 4px; color: #333; padding: 0; margin: 0; }
             QPushButton:hover { background-color: #e5e5e5; }
-            QPushButton:focus { outline: none; border: none; }
             QLineEdit { padding: 4px 10px; border: 1px solid #eee; border-radius: 5px; background: #f9f9f9; }
             QPushButton#fab-trigger { border-radius: 16px; background-color: rgba(53, 132, 228, 180); color: white; font-size: 16px; }
-            QPushButton#fab-trigger:hover { background-color: #3584e4; }
+            QPushButton#fab-trigger:hover { background-color: rgba(53, 132, 228, 255); }
             QPushButton#fab-small { border-radius: 14px; background-color: rgba(60, 60, 60, 160); color: white; font-size: 12px; }
-            QPushButton#fab-small:hover { background-color: #444; }
+            QPushButton#fab-small:hover { background-color: rgba(80, 80, 80, 220); }
+            QSlider#fab-vol { background: rgba(60, 60, 60, 160); border-radius: 14px; padding: 10px 0px; }
+            QSlider::groove:vertical#fab-vol { background: rgba(255, 255, 255, 40); width: 4px; border-radius: 2px; }
+            QSlider::handle:vertical#fab-vol { background: #3584e4; height: 12px; width: 12px; margin: 0 -4px; border-radius: 6px; }
             QListView { background-color: white; border: none; }
-            QListView::item { padding: 6px 10px; border-radius: 8px; margin-bottom: 2px; border: none; }
+            QListView::item { padding: 6px 10px; border-radius: 8px; margin-bottom: 2px; }
             QListView::item:selected { background-color: #3584e4; color: white; }
-            QScrollBar:vertical { border: none; background: #f8f8f8; width: 8px; margin: 0; }
-            QScrollBar::handle:vertical { background: #ccc; min-height: 30px; border-radius: 4px; }
+            QScrollBar:vertical { border: none; background: transparent; width: 8px; margin: 0; }
+            QScrollBar::handle:vertical { background: #ccc; border-radius: 4px; min-height: 20px; }
             QScrollBar::handle:vertical:hover { background: #3584e4; }
-            QScrollBar::add-line, QScrollBar::sub-line { height: 0px; }
+            QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page { background: none; height: 0px; }
+            QToolTip { background-color: #333; color: white; border: 1px solid #555; padding: 3px; border-radius: 4px; font-weight: bold; }
         """)
     def toggle_fab(self):
         self.sub_buttons.setVisible(not self.sub_buttons.isVisible())
+        if self.sub_buttons.isVisible():
+            res = self.send_command({"command": ["get_property", "volume"]})
+            if res and "data" in res:
+                self.vol_slider.blockSignals(True)
+                v = int(res["data"])
+                self.vol_slider.setValue(v)
+                self.vol_slider.blockSignals(False)
         self.update_fab_pos()
+    def on_vol_changed(self, val):
+        self.send_command({"command": ["set_property", "volume", val]})
+        pos = self.vol_slider.mapToGlobal(QPoint(-55, self.vol_slider.height() // 2 - 10))
+        QToolTip.showText(pos, f"{val}%", self.vol_slider)
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_fab_pos()
     def update_fab_pos(self):
         self.fab_container.adjustSize()
-        self.fab_container.move(self.width() - self.fab_container.width() - 25, self.height() - self.fab_container.height() - 25)
+        self.fab_container.move(self.width() - self.fab_container.width() - 20, self.height() - self.fab_container.height() - 20)
     def ensure_mpv_running(self):
         try:
             if os.path.exists(self.socket_path):
                 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(0.2); s.connect(self.socket_path); s.close()
             else: raise FileNotFoundError
         except:
-            try: subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-            except: pass
+            subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     def load_favs(self):
         try:
             if os.path.exists(self.fav_file):
@@ -153,48 +174,48 @@ class MPVQtManager(QMainWindow):
                         c = json.load(f); self.move(c.get("x", 100), c.get("y", 100)); self.resize(c.get("w", 280), c.get("h", 750)); self.last_file = c.get("last_file", ""); self.current_group = c.get("current_group", "All")
             except: pass
     def save_config(self):
-        g = self.geometry(); path_res = self.send_command({"command": ["get_property", "path"]}); curr_path = path_res.get("data", "") if path_res else ""
+        g = self.geometry(); pr = self.send_command({"command": ["get_property", "path"]}); cp = pr.get("data", "") if pr else ""
         with self.lock:
             try:
                 Path(os.path.dirname(self.config_file) or ".").mkdir(parents=True, exist_ok=True)
-                with open(self.config_file, "w", encoding="utf-8") as f: json.dump({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(), "last_file": curr_path, "current_group": self.current_group}, f)
+                with open(self.config_file, "w", encoding="utf-8") as f: json.dump({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(), "last_file": cp, "current_group": self.current_group}, f)
             except: pass
     def closeEvent(self, event):
         self.save_config(); super().closeEvent(event)
     def send_command(self, cmd, timeout=1.0):
-        client = None
+        cl = None
         try:
-            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); client.settimeout(timeout); client.connect(self.socket_path); client.sendall(json.dumps(cmd).encode() + b"\n")
-            res = b""
+            cl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); cl.settimeout(timeout); cl.connect(self.socket_path); cl.sendall(json.dumps(cmd).encode() + b"\n")
+            r = b""
             while True:
-                chunk = client.recv(8192)
-                if not chunk: break
-                res += chunk
-                if b"\n" in res: break
-            return json.loads(res.decode(errors="ignore").splitlines()[0])
+                ch = cl.recv(8192)
+                if not ch: break
+                r += ch
+                if b"\n" in r: break
+            return json.loads(r.decode(errors="ignore").splitlines()[0])
         except: return None
         finally:
-            if client: client.close()
+            if cl: cl.close()
     def update_playlist(self):
         if self.is_updating: return
         self.is_updating = True; threading.Thread(target=self._update_thread, daemon=True).start()
     def _update_thread(self):
-        res = self.send_command({"command": ["get_property", "playlist"]}); curr = self.send_command({"command": ["get_property", "path"]}); curr_path = curr.get("data", "") if curr else ""
+        res = self.send_command({"command": ["get_property", "playlist"]}); curr = self.send_command({"command": ["get_property", "path"]}); cp = curr.get("data", "") if curr else ""
         if not res or "data" not in res: self.is_updating = False; return
-        g_counts, items = {}, []
-        with self.lock: favs_copy = set(self.favorites)
+        gc, items = {}, []
+        with self.lock: fc = set(self.favorites)
         for idx, i in enumerate(res["data"]):
-            fn = i.get("filename", ""); nm = i.get("title") or os.path.basename(fn); grp = self.m3u_groups.get(nm, "Uncategorized"); g_counts[grp] = g_counts.get(grp, 0) + 1; items.append({"name": nm, "filename": fn, "orig_idx": idx, "group": grp})
-        def sort_priority(x):
-            is_f = x["name"] in favs_copy; in_g = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_f) or (x["group"] == self.current_group); return (not in_g, not is_f, x["name"].lower())
-        full_sorted = sorted(items, key=sort_priority, reverse=(self.sort_mode == 1))
-        for target_idx, item in enumerate(full_sorted):
-            if item["orig_idx"] != target_idx:
-                self.send_command({"command": ["playlist-move", item["orig_idx"], target_idx]})
-                for other in items:
-                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx: other["orig_idx"] += 1
-                item["orig_idx"] = target_idx
-        self.signals.finished.emit(g_counts, full_sorted, curr_path)
+            fn = i.get("filename", ""); nm = i.get("title") or os.path.basename(fn); grp = self.m3u_groups.get(nm, "Uncategorized"); gc[grp] = gc.get(grp, 0) + 1; items.append({"name": nm, "filename": fn, "orig_idx": idx, "group": grp})
+        def sp(x):
+            isf = x["name"] in fc; ing = (self.current_group == "All") or (self.current_group == "★ Favorites" and isf) or (x["group"] == self.current_group); return (not ing, not isf, x["name"].lower())
+        fs = sorted(items, key=sp, reverse=(self.sort_mode == 1))
+        for t_idx, item in enumerate(fs):
+            if item["orig_idx"] != t_idx:
+                self.send_command({"command": ["playlist-move", item["orig_idx"], t_idx]})
+                for o in items:
+                    if o["orig_idx"] < item["orig_idx"] and o["orig_idx"] >= t_idx: o["orig_idx"] += 1
+                item["orig_idx"] = t_idx
+        self.signals.finished.emit(gc, fs, cp)
     def _finalize_update(self, group_counts, full_sorted, curr_path):
         self.full_list, self.group_counts, self.current_playing_filename = full_sorted, group_counts, curr_path or ""; self.filter_playlist()
         if not self.resume_done and self.last_file:
@@ -203,9 +224,9 @@ class MPVQtManager(QMainWindow):
         self.is_updating = False
     def show_group_menu(self):
         menu = QMenu(self); self.update_fab_pos()
-        with self.lock: favs_copy = set(self.favorites)
-        fav_count = sum(1 for x in self.full_list if x["name"] in favs_copy)
-        for gn, c in [("All", len(self.full_list)), ("★ Favorites", fav_count)]:
+        with self.lock: fc = set(self.favorites)
+        f_count = sum(1 for x in self.full_list if x["name"] in fc)
+        for gn, c in [("All", len(self.full_list)), ("★ Favorites", f_count)]:
             lbl = f"{gn} ({c})"
             if self.current_group == gn: lbl = f"• {lbl}"
             menu.addAction(lbl).triggered.connect(lambda chk=False, n=gn: self.set_active_group(n))
@@ -220,21 +241,21 @@ class MPVQtManager(QMainWindow):
     def show_burger_menu(self):
         menu = QMenu(self); menu.addAction("Open Playlist").triggered.connect(self.on_load_clicked); menu.addAction("Toggle Sort").triggered.connect(self.toggle_sort); menu.addAction("Refresh").triggered.connect(self.update_playlist); menu.addSeparator(); menu.addAction("Clear Playlist").triggered.connect(self.on_clear_clicked); menu.exec(self.burger_btn.mapToGlobal(QPoint(0, self.burger_btn.height())))
     def filter_playlist(self):
-        self.list_model.clear(); q = self.search_entry.text().lower().strip(); scroll_idx = None
-        with self.lock: favs_copy = set(self.favorites)
+        self.list_model.clear(); q = self.search_entry.text().lower().strip(); si = None
+        with self.lock: fc = set(self.favorites)
         for i in self.full_list:
-            nm, grp, idx, fn = i["name"], i["group"], i["orig_idx"], i["filename"]; is_f = nm in favs_copy
+            nm, grp, idx, fn = i["name"], i["group"], i["orig_idx"], i["filename"]; isf = nm in fc
             if "Favorites" in self.current_group:
-                if not is_f: continue
+                if not isf: continue
             elif "All" not in self.current_group and grp != self.current_group: continue
             if q and q not in nm.lower(): continue
-            is_p = (fn == self.current_playing_filename); d_nm = f"★ {nm}" if is_f else nm
-            if is_p: d_nm = f"▶  {d_nm}"
-            q_i = QStandardItem(d_nm); q_i.setData(idx, self.USER_ROLE)
-            if is_p: font = QFont(); font.setBold(True); q_i.setFont(font); q_i.setBackground(QColor("#3584e4")); q_i.setForeground(QColor("#ffffff"))
-            self.list_model.appendRow(q_i)
-            if is_p: scroll_idx = q_i.index()
-        if scroll_idx: self.tree_view.selectionModel().setCurrentIndex(scroll_idx, QItemSelectionModel.ClearAndSelect); self.tree_view.scrollTo(scroll_idx, QAbstractItemView.PositionAtCenter)
+            isp = (fn == self.current_playing_filename); dnm = f"★ {nm}" if isf else nm
+            if isp: dnm = f"▶  {dnm}"
+            qi = QStandardItem(dnm); qi.setData(idx, self.USER_ROLE)
+            if isp: f = QFont(); f.setBold(True); qi.setFont(f); qi.setBackground(QColor("#3584e4")); qi.setForeground(QColor("#ffffff"))
+            self.list_model.appendRow(qi)
+            if isp: si = qi.index()
+        if si: self.tree_view.selectionModel().setCurrentIndex(si, QItemSelectionModel.ClearAndSelect); self.tree_view.scrollTo(si, QAbstractItemView.PositionAtCenter)
     def update_now_playing(self):
         res = self.send_command({"command": ["get_property", "path"]})
         if res and "data" in res and res["data"] != self.current_playing_filename: self.current_playing_filename = res["data"]; self.filter_playlist()
@@ -284,7 +305,7 @@ class MPVQtManager(QMainWindow):
                     else: self.favorites.add(name)
                 self.save_favs(); self.update_playlist()
     def on_row_activated(self, idx):
-        orig_idx = idx.data(self.USER_ROLE)
-        if orig_idx is not None: self.send_command({"command": ["set_property", "playlist-pos", orig_idx]}); self.send_command({"command": ["set_property", "pause", False]})
+        oi = idx.data(self.USER_ROLE)
+        if oi is not None: self.send_command({"command": ["set_property", "playlist-pos", oi]}); self.send_command({"command": ["set_property", "pause", False]})
 if __name__ == "__main__":
     app = QApplication(sys.argv); win = MPVQtManager(); win.show(); sys.exit(app.exec())

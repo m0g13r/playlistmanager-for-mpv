@@ -5,10 +5,11 @@ import os
 import subprocess
 import re
 import threading
+import glob
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QCursor
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QCursor, QIcon
 os.environ["QT_ACCESSIBILITY"] = "0"
 class UpdateSignals(QObject):
     finished = Signal(object, list, str)
@@ -77,18 +78,20 @@ class MPVQtManager(QMainWindow):
         self.sub_layout.setSpacing(6)
         self.vol_slider = QSlider(Qt.Vertical)
         self.vol_slider.setRange(0, 130)
-        self.vol_slider.setFixedSize(28, 120)
+        self.vol_slider.setFixedSize(32, 120)
         self.vol_slider.setObjectName("fab-vol")
         self.vol_slider.valueChanged.connect(self.on_vol_changed)
         self.sub_layout.addWidget(self.vol_slider)
-        for icon, cmd in [("⏭", ["playlist-next"]), ("⏯", ["cycle", "pause"]), ("⏮", ["playlist-prev"])]:
-            btn = QPushButton(icon)
+        for icon_name, cmd in [("media-skip-forward-symbolic", ["playlist-next"]), ("media-playback-start-symbolic", ["cycle", "pause"]), ("media-skip-backward-symbolic", ["playlist-prev"])]:
+            btn = QPushButton()
+            btn.setIcon(QIcon.fromTheme(icon_name))
             btn.setObjectName("fab-small")
-            btn.setFixedSize(28, 28)
+            btn.setFixedSize(32, 32)
             btn.clicked.connect(lambda checked=False, c=cmd: self.send_command({"command": c}))
             self.sub_layout.addWidget(btn)
         self.sub_buttons.setVisible(False)
-        self.main_fab = QPushButton("⋮")
+        self.main_fab = QPushButton()
+        self.main_fab.setIcon(QIcon.fromTheme("view-more-horizontal-symbolic"))
         self.main_fab.setObjectName("fab-trigger")
         self.main_fab.setFixedSize(32, 32)
         self.main_fab.clicked.connect(self.toggle_fab)
@@ -103,6 +106,10 @@ class MPVQtManager(QMainWindow):
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_now_playing)
         self.timer.start(2000)
+        self.socket_timer = QTimer()
+        self.socket_timer.timeout.connect(self.refresh_sockets)
+        self.socket_timer.start(5000)
+        self.available_sockets = []
         self.resize(280, 750)
     def apply_styles(self):
         self.setStyleSheet("""
@@ -111,11 +118,11 @@ class MPVQtManager(QMainWindow):
             QPushButton { border: none; background-color: #f2f2f2; border-radius: 4px; color: #333; padding: 0; margin: 0; }
             QPushButton:hover { background-color: #e5e5e5; }
             QLineEdit { padding: 4px 10px; border: 1px solid #eee; border-radius: 5px; background: #f9f9f9; }
-            QPushButton#fab-trigger { border-radius: 16px; background-color: rgba(53, 132, 228, 180); color: white; font-size: 16px; }
+            QPushButton#fab-trigger { border-radius: 16px; background-color: rgba(53, 132, 228, 180); qproperty-iconSize: 20px; }
             QPushButton#fab-trigger:hover { background-color: rgba(53, 132, 228, 255); }
-            QPushButton#fab-small { border-radius: 14px; background-color: rgba(60, 60, 60, 160); color: white; font-size: 12px; }
+            QPushButton#fab-small { border-radius: 16px; background-color: rgba(60, 60, 60, 160); qproperty-iconSize: 16px; }
             QPushButton#fab-small:hover { background-color: rgba(80, 80, 80, 220); }
-            QSlider#fab-vol { background: rgba(60, 60, 60, 160); border-radius: 14px; padding: 10px 0px; }
+            QSlider#fab-vol { background: rgba(60, 60, 60, 160); border-radius: 16px; padding: 10px 0px; }
             QSlider::groove:vertical#fab-vol { background: rgba(255, 255, 255, 40); width: 4px; border-radius: 2px; }
             QSlider::handle:vertical#fab-vol { background: #3584e4; height: 12px; width: 12px; margin: 0 -4px; border-radius: 6px; }
             QListView { background-color: white; border: none; }
@@ -145,15 +152,27 @@ class MPVQtManager(QMainWindow):
         super().resizeEvent(event)
         self.update_fab_pos()
     def update_fab_pos(self):
-        self.fab_container.adjustSize()
-        self.fab_container.move(self.width() - self.fab_container.width() - 20, self.height() - self.fab_container.height() - 20)
+        w = 32
+        h = 32 if not self.sub_buttons.isVisible() else (32 + 6 + 32 + 6 + 32 + 6 + 32 + 6 + 120)
+        self.fab_container.setFixedSize(w, h)
+        self.fab_container.move(self.width() - w - 40, self.height() - h - 20)
     def ensure_mpv_running(self):
-        try:
-            if os.path.exists(self.socket_path):
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(0.2); s.connect(self.socket_path); s.close()
-            else: raise FileNotFoundError
-        except:
+        if not os.path.exists(self.socket_path):
             subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    def refresh_sockets(self):
+        sockets = glob.glob("/tmp/mpvsocket*")
+        new_sockets = []
+        for s in sockets:
+            old_p = self.socket_path
+            self.socket_path = s
+            title_res = self.send_command({"command": ["get_property", "media-title"]})
+            self.socket_path = old_p
+            label = title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)
+            new_sockets.append((s, label))
+        self.available_sockets = new_sockets
+    def switch_socket(self, path):
+        self.socket_path = path
+        self.update_playlist()
     def load_favs(self):
         try:
             if os.path.exists(self.fav_file):
@@ -182,20 +201,23 @@ class MPVQtManager(QMainWindow):
             except: pass
     def closeEvent(self, event):
         self.save_config(); super().closeEvent(event)
-    def send_command(self, cmd, timeout=1.0):
-        cl = None
+    def send_command(self, cmd, timeout=0.5):
         try:
-            cl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); cl.settimeout(timeout); cl.connect(self.socket_path); cl.sendall(json.dumps(cmd).encode() + b"\n")
-            r = b""
-            while True:
-                ch = cl.recv(8192)
-                if not ch: break
-                r += ch
-                if b"\n" in r: break
-            return json.loads(r.decode(errors="ignore").splitlines()[0])
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(timeout); c.connect(self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
+                res = b""
+                while True:
+                    chunk = c.recv(8192)
+                    if not chunk: break
+                    res += chunk
+                    if res.endswith(b"\n"): break
+                if res:
+                    for line in res.decode(errors="ignore").splitlines():
+                        try:
+                            data = json.loads(line)
+                            if "request_id" in data or "error" in data: return data
+                        except: continue
         except: return None
-        finally:
-            if cl: cl.close()
     def update_playlist(self):
         if self.is_updating: return
         self.is_updating = True; threading.Thread(target=self._update_thread, daemon=True).start()
@@ -239,7 +261,18 @@ class MPVQtManager(QMainWindow):
     def set_active_group(self, name):
         self.current_group = name; self.save_config(); self.update_playlist()
     def show_burger_menu(self):
-        menu = QMenu(self); menu.addAction("Open Playlist").triggered.connect(self.on_load_clicked); menu.addAction("Toggle Sort").triggered.connect(self.toggle_sort); menu.addAction("Refresh").triggered.connect(self.update_playlist); menu.addSeparator(); menu.addAction("Clear Playlist").triggered.connect(self.on_clear_clicked); menu.exec(self.burger_btn.mapToGlobal(QPoint(0, self.burger_btn.height())))
+        menu = QMenu(self)
+        menu.addAction("Open Playlist").triggered.connect(self.on_load_clicked)
+        menu.addAction("Toggle Sort").triggered.connect(self.toggle_sort)
+        menu.addAction("Refresh").triggered.connect(self.update_playlist)
+        menu.addSeparator()
+        sock_menu = menu.addMenu("Select Player")
+        for s_path, s_label in self.available_sockets:
+            lbl = f"✔ {s_label}" if s_path == self.socket_path else s_label
+            sock_menu.addAction(lbl).triggered.connect(lambda chk=False, p=s_path: self.switch_socket(p))
+        menu.addSeparator()
+        menu.addAction("Clear Playlist").triggered.connect(self.on_clear_clicked)
+        menu.exec(self.burger_btn.mapToGlobal(QPoint(0, self.burger_btn.height())))
     def filter_playlist(self):
         self.list_model.clear(); q = self.search_entry.text().lower().strip(); si = None
         with self.lock: fc = set(self.favorites)

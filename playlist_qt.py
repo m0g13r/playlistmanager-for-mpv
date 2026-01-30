@@ -9,10 +9,13 @@ import glob
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QCursor, QIcon
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QIcon
+
 os.environ["QT_ACCESSIBILITY"] = "0"
+
 class UpdateSignals(QObject):
     finished = Signal(object, list, str)
+
 class MPVQtManager(QMainWindow):
     USER_ROLE = Qt.UserRole
     def __init__(self):
@@ -21,7 +24,7 @@ class MPVQtManager(QMainWindow):
         self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowCloseButtonHint)
         self.setAcceptDrops(True)
         self.setWindowTitle("MPV")
-        self.socket_path = "/tmp/mpvsocket"
+        self.socket_path = "/dev/shm/mpvsocket"
         self.fav_file = os.path.expanduser("~/.mpv_favorites.json")
         self.last_m3u_file = os.path.expanduser("~/.mpv_last_playlist.json")
         self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
@@ -110,7 +113,6 @@ class MPVQtManager(QMainWindow):
         self.socket_timer.timeout.connect(self.refresh_sockets)
         self.socket_timer.start(5000)
         self.available_sockets = []
-        self.resize(280, 750)
     def apply_styles(self):
         self.setStyleSheet("""
             QMainWindow { background-color: #ffffff; }
@@ -140,8 +142,7 @@ class MPVQtManager(QMainWindow):
             res = self.send_command({"command": ["get_property", "volume"]})
             if res and "data" in res:
                 self.vol_slider.blockSignals(True)
-                v = int(res["data"])
-                self.vol_slider.setValue(v)
+                self.vol_slider.setValue(int(res["data"]))
                 self.vol_slider.blockSignals(False)
         self.update_fab_pos()
     def on_vol_changed(self, val):
@@ -151,6 +152,10 @@ class MPVQtManager(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_fab_pos()
+        self.save_config()
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.save_config()
     def update_fab_pos(self):
         w = 32
         h = 32 if not self.sub_buttons.isVisible() else (32 + 6 + 32 + 6 + 32 + 6 + 32 + 6 + 120)
@@ -160,7 +165,7 @@ class MPVQtManager(QMainWindow):
         if not os.path.exists(self.socket_path):
             subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     def refresh_sockets(self):
-        sockets = glob.glob("/tmp/mpvsocket*")
+        sockets = glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*")
         new_sockets = []
         for s in sockets:
             old_p = self.socket_path
@@ -190,14 +195,22 @@ class MPVQtManager(QMainWindow):
             try:
                 if os.path.exists(self.config_file):
                     with open(self.config_file, "r", encoding="utf-8") as f:
-                        c = json.load(f); self.move(c.get("x", 100), c.get("y", 100)); self.resize(c.get("w", 280), c.get("h", 750)); self.last_file = c.get("last_file", ""); self.current_group = c.get("current_group", "All")
-            except: pass
+                        c = json.load(f)
+                        self.move(c.get("x", 100), c.get("y", 100))
+                        self.resize(c.get("w", 280), c.get("h", 750))
+                        self.last_file = c.get("last_file", "")
+                        self.current_group = c.get("current_group", "All")
+                else:
+                    self.resize(280, 750)
+            except: self.resize(280, 750)
     def save_config(self):
-        g = self.geometry(); pr = self.send_command({"command": ["get_property", "path"]}); cp = pr.get("data", "") if pr else ""
+        pr = self.send_command({"command": ["get_property", "path"]})
+        cp = pr.get("data", "") if pr else self.last_file
         with self.lock:
             try:
                 Path(os.path.dirname(self.config_file) or ".").mkdir(parents=True, exist_ok=True)
-                with open(self.config_file, "w", encoding="utf-8") as f: json.dump({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(), "last_file": cp, "current_group": self.current_group}, f)
+                with open(self.config_file, "w", encoding="utf-8") as f:
+                    json.dump({"x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(), "last_file": cp, "current_group": self.current_group}, f)
             except: pass
     def closeEvent(self, event):
         self.save_config(); super().closeEvent(event)

@@ -7,9 +7,9 @@ start it like ....
 
 .
 
-mpv --idle --input-ipc-server=/tmp/mpvsocket &
+mpv --idle --input-ipc-server=/dev/shm/mpvsocket &
 
-while [ ! -S /tmp/mpvsocket ]; do sleep 0.1; done
+while [ ! -S /dev/shm/mpvsocket ]; do sleep 0.1; done
 
 python3 /your path to/playlist_gtk/qt.py
 

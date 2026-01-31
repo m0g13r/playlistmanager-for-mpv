@@ -19,13 +19,13 @@ class MPVGTKManager(Gtk.Window):
         hb = Gtk.HeaderBar(show_close_button=True, decoration_layout="menu:close")
         hb.get_style_context().add_class("compact-header")
         self.set_titlebar(hb)
-        self.search_entry = Gtk.SearchEntry(placeholder_text="Suche...", hexpand=True, width_chars=1)
+        self.search_entry = Gtk.SearchEntry(placeholder_text="Search...", hexpand=True, width_chars=1)
         self.search_entry.connect("changed", lambda w: self.filter.refilter())
         hb.set_custom_title(self.search_entry)
         self.menu_button, self.group_button = Gtk.MenuButton(label="≡"), Gtk.MenuButton(label="▾")
         self.main_menu, self.group_menu = Gtk.Menu(), Gtk.Menu()
         self.socket_submenu = Gtk.Menu()
-        self.socket_root_item = Gtk.MenuItem(label="Player wählen")
+        self.socket_root_item = Gtk.MenuItem(label="Select Player")
         self.socket_root_item.set_submenu(self.socket_submenu)
         self.rebuild_main_menu()
         self.menu_button.set_popup(self.main_menu)
@@ -83,7 +83,7 @@ class MPVGTKManager(Gtk.Window):
         if not os.path.exists(self.socket_path): subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     def rebuild_main_menu(self):
         for c in self.main_menu.get_children(): self.main_menu.remove(c)
-        for l, cb in [("Playlist öffnen", self.on_load_clicked), ("Sortierung umschalten", self.toggle_sort), ("Aktualisieren", lambda x: self.update_playlist()), ("Playlist leeren", self.on_clear_clicked)]:
+        for l, cb in [("Open Playlist", self.on_load_clicked), ("Toggle Sorting", self.toggle_sort), ("Refresh", lambda x: self.update_playlist()), ("Clear Playlist", self.on_clear_clicked)]:
             mi = Gtk.MenuItem(label=l)
             mi.connect("activate", cb)
             self.main_menu.append(mi)
@@ -150,7 +150,7 @@ class MPVGTKManager(Gtk.Window):
         for idx, i in enumerate(res["data"]):
             fn = i.get("filename", ""); name = i.get("title") or os.path.basename(fn); grp = self.m3u_groups.get(name, "Uncategorized"); groups.add(grp); items.append({"name": name, "filename": fn, "orig_idx": idx, "group": grp})
         def sort_p(x):
-            is_fav = x["name"] in fav_copy; in_group = (self.current_group == "All") or (self.current_group == "★ Favoriten" and is_fav) or (x["group"] == self.current_group); return (not in_group, not is_fav, x["name"].lower())
+            is_fav = x["name"] in fav_copy; in_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group); return (not in_group, not is_fav, x["name"].lower())
         full_sorted = sorted(items, key=sort_p, reverse=(self.sort_mode == 1))
         for target_idx, item in enumerate(full_sorted):
             if item["orig_idx"] != target_idx:
@@ -182,9 +182,9 @@ class MPVGTKManager(Gtk.Window):
     def rebuild_group_menu(self, groups):
         for c in self.group_menu.get_children(): self.group_menu.remove(c)
         with self.favorites_lock: fav_copy = set(self.favorites)
-        counts = {"All": len(self.full_list_data), "★ Favoriten": sum(1 for x in self.full_list_data if x["name"] in fav_copy)}
+        counts = {"All": len(self.full_list_data), "★ Favorites": sum(1 for x in self.full_list_data if x["name"] in fav_copy)}
         for g in groups: counts[g] = sum(1 for x in self.full_list_data if x["group"] == g)
-        for o in ["All", "★ Favoriten"] + sorted(list(groups)):
+        for o in ["All", "★ Favorites"] + sorted(list(groups)):
             lbl = f"{o} ({counts.get(o, 0)})"; item = Gtk.MenuItem(label=f"• {lbl}" if o == self.current_group else lbl)
             item.connect("activate", self.on_group_selected, o); self.group_menu.append(item)
         self.group_menu.show_all()
@@ -201,13 +201,13 @@ class MPVGTKManager(Gtk.Window):
         return True
     def filter_func(self, model, iter, data):
         dn = model.get_value(iter, 0); name, grp, q = dn.replace("★ ", "").replace("▶ ", "").replace("⏸ ", ""), model.get_value(iter, 3), self.search_entry.get_text().lower()
-        if self.current_group == "★ Favoriten":
+        if self.current_group == "★ Favorites":
             with self.favorites_lock: return name.strip() in self.favorites and q in name.lower()
         return q in name.lower() if self.current_group == "All" else (grp == self.current_group and q in name.lower())
     def toggle_sort(self, mi): self.sort_mode = 1 - self.sort_mode; self.update_playlist()
     def on_load_clicked(self, mi):
-        diag = Gtk.FileChooserDialog(title="Playlist wählen", parent=self, action=Gtk.FileChooserAction.OPEN)
-        diag.add_buttons("_Abbrechen", Gtk.ResponseType.CANCEL, "_Öffnen", Gtk.ResponseType.OK)
+        diag = Gtk.FileChooserDialog(title="Select Playlist", parent=self, action=Gtk.FileChooserAction.OPEN)
+        diag.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Open", Gtk.ResponseType.OK)
         if diag.run() == Gtk.ResponseType.OK: self.load_playlist_file(diag.get_filename())
         diag.destroy()
     def on_clear_clicked(self, mi): self.send_command({"command": ["playlist-clear"]}); self.m3u_groups = {}; self.update_playlist()

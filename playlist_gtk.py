@@ -19,13 +19,13 @@ class MPVGTKManager(Gtk.Window):
         hb = Gtk.HeaderBar(show_close_button=True, decoration_layout="menu:close")
         hb.get_style_context().add_class("compact-header")
         self.set_titlebar(hb)
-        self.search_entry = Gtk.SearchEntry(placeholder_text="Search...", hexpand=True, width_chars=1)
+        self.search_entry = Gtk.SearchEntry(placeholder_text="Suche...", hexpand=True, width_chars=1)
         self.search_entry.connect("changed", lambda w: self.filter.refilter())
         hb.set_custom_title(self.search_entry)
         self.menu_button, self.group_button = Gtk.MenuButton(label="≡"), Gtk.MenuButton(label="▾")
         self.main_menu, self.group_menu = Gtk.Menu(), Gtk.Menu()
         self.socket_submenu = Gtk.Menu()
-        self.socket_root_item = Gtk.MenuItem(label="Select Player")
+        self.socket_root_item = Gtk.MenuItem(label="Player wählen")
         self.socket_root_item.set_submenu(self.socket_submenu)
         self.rebuild_main_menu()
         self.menu_button.set_popup(self.main_menu)
@@ -55,7 +55,7 @@ class MPVGTKManager(Gtk.Window):
         sub_box.pack_start(self.vol_scale, False, False, 0)
         for icon, cmd in [("media-skip-forward-symbolic", ["playlist-next"]), ("media-playback-start-symbolic", ["cycle", "pause"]), ("media-skip-backward-symbolic", ["playlist-prev"])]:
             btn = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.MENU)
-            for c in ["fab-button", "fab-small"]: btn.get_style_context().add_class(c)
+            for cls in ["fab-button", "fab-small"]: btn.get_style_context().add_class(cls)
             btn.connect("clicked", lambda w, c=cmd: (self.send_command({"command": c}), self.revealer.set_reveal_child(False)))
             sub_box.pack_start(btn, False, False, 0)
         self.revealer.add(sub_box)
@@ -80,17 +80,10 @@ class MPVGTKManager(Gtk.Window):
         p.load_from_data(css)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
     def ensure_mpv_running(self):
-        active = False
-        if os.path.exists(self.socket_path):
-            chk = self.send_command({"command": ["get_property", "idle"]})
-            if chk and chk.get("error") == "success": active = True
-            else:
-                try: os.remove(self.socket_path)
-                except: pass
-        if not active: subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not os.path.exists(self.socket_path): subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     def rebuild_main_menu(self):
         for c in self.main_menu.get_children(): self.main_menu.remove(c)
-        for l, cb in [("Open Playlist", self.on_load_clicked), ("Toggle Sort", self.toggle_sort), ("Refresh", lambda x: self.update_playlist()), ("Clear Playlist", self.on_clear_clicked)]:
+        for l, cb in [("Playlist öffnen", self.on_load_clicked), ("Sortierung umschalten", self.toggle_sort), ("Aktualisieren", lambda x: self.update_playlist()), ("Playlist leeren", self.on_clear_clicked)]:
             mi = Gtk.MenuItem(label=l)
             mi.connect("activate", cb)
             self.main_menu.append(mi)
@@ -99,14 +92,16 @@ class MPVGTKManager(Gtk.Window):
         self.main_menu.show_all()
     def refresh_sockets(self):
         for c in self.socket_submenu.get_children(): self.socket_submenu.remove(c)
-        sockets = sorted(list(set(glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*"))))
+        sockets = glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*")
         for s in sockets:
-            old = self.socket_path; self.socket_path = s; res = self.send_command({"command": ["get_property", "media-title"]}); self.socket_path = old
-            if res and res.get("error") == "success":
-                label = res.get("data") if res.get("data") else os.path.basename(s)
-                mi = Gtk.MenuItem(label=f"✔ {label}" if s == self.socket_path else label)
-                mi.connect("activate", self.switch_socket, s)
-                self.socket_submenu.append(mi)
+            old_path = self.socket_path
+            self.socket_path = s
+            title_res = self.send_command({"command": ["get_property", "media-title"]})
+            self.socket_path = old_path
+            label = title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)
+            mi = Gtk.MenuItem(label=f"✔ {label}" if s == self.socket_path else label)
+            mi.connect("activate", self.switch_socket, s)
+            self.socket_submenu.append(mi)
         self.socket_submenu.show_all()
         return True
     def switch_socket(self, mi, path):
@@ -122,34 +117,29 @@ class MPVGTKManager(Gtk.Window):
             Path(os.path.dirname(self.fav_file) or ".").mkdir(parents=True, exist_ok=True)
             with open(self.fav_file, "w", encoding="utf-8") as f: json.dump(list(self.favorites), f)
     def send_command(self, cmd):
-        for _ in range(2):
-            try:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-                    c.settimeout(0.3); c.connect(self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
-                    res = b""
-                    while True:
-                        chunk = c.recv(16384)
-                        if not chunk: break
-                        res += chunk
-                        if b"\n" in res:
-                            for line in res.decode(errors="ignore").splitlines():
-                                try:
-                                    data = json.loads(line)
-                                    if any(k in data for k in ["request_id", "error", "data"]): return data
-                                except: continue
-                            break
-            except (socket.error, socket.timeout):
-                if _ == 0: self.ensure_mpv_running()
-                else: return None
-        return None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(0.5); c.connect(self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
+                res = b""
+                while True:
+                    chunk = c.recv(8192)
+                    if not chunk: break
+                    res += chunk
+                    if b"\n" in res: break
+                if res:
+                    for line in res.decode(errors="ignore").splitlines():
+                        try:
+                            data = json.loads(line)
+                            if "request_id" in data or "error" in data: return data
+                        except: continue
+        except: return None
     def update_playlist(self):
         with self.update_lock:
             if self.is_updating: return
             self.is_updating = True
         threading.Thread(target=self._update_thread, daemon=True).start()
     def _update_thread(self):
-        res, path_res = self.send_command({"command": ["get_property", "playlist"]}), self.send_command({"command": ["get_property", "path"]})
-        pause_res = self.send_command({"command": ["get_property", "pause"]})
+        res, path_res, pause_res = self.send_command({"command": ["get_property", "playlist"]}), self.send_command({"command": ["get_property", "path"]}), self.send_command({"command": ["get_property", "pause"]})
         curr_p = path_res.get("data", "") if path_res else ""
         self.is_paused = pause_res.get("data", False) if pause_res else False
         if not res or "data" not in res:
@@ -157,16 +147,10 @@ class MPVGTKManager(Gtk.Window):
             return
         groups, items = set(), []
         with self.favorites_lock: fav_copy = set(self.favorites)
-        rev_map = {v['filename']: k for k, v in self.m3u_groups.items()}
         for idx, i in enumerate(res["data"]):
-            fn = i.get("filename", "")
-            orig_name = rev_map.get(fn)
-            name = orig_name if orig_name else (i.get("title") or os.path.basename(fn))
-            grp = "Uncategorized"
-            if orig_name and orig_name in self.m3u_groups: grp = self.m3u_groups[orig_name].get("group", "Uncategorized")
-            groups.add(grp); items.append({"name": name, "filename": fn, "orig_idx": idx, "group": grp})
+            fn = i.get("filename", ""); name = i.get("title") or os.path.basename(fn); grp = self.m3u_groups.get(name, "Uncategorized"); groups.add(grp); items.append({"name": name, "filename": fn, "orig_idx": idx, "group": grp})
         def sort_p(x):
-            is_fav = x["name"] in fav_copy; in_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group); return (not in_group, not is_fav, x["name"].lower())
+            is_fav = x["name"] in fav_copy; in_group = (self.current_group == "All") or (self.current_group == "★ Favoriten" and is_fav) or (x["group"] == self.current_group); return (not in_group, not is_fav, x["name"].lower())
         full_sorted = sorted(items, key=sort_p, reverse=(self.sort_mode == 1))
         for target_idx, item in enumerate(full_sorted):
             if item["orig_idx"] != target_idx:
@@ -198,9 +182,9 @@ class MPVGTKManager(Gtk.Window):
     def rebuild_group_menu(self, groups):
         for c in self.group_menu.get_children(): self.group_menu.remove(c)
         with self.favorites_lock: fav_copy = set(self.favorites)
-        counts = {"All": len(self.full_list_data), "★ Favorites": sum(1 for x in self.full_list_data if x["name"] in fav_copy)}
+        counts = {"All": len(self.full_list_data), "★ Favoriten": sum(1 for x in self.full_list_data if x["name"] in fav_copy)}
         for g in groups: counts[g] = sum(1 for x in self.full_list_data if x["group"] == g)
-        for o in ["All", "★ Favorites"] + sorted(list(groups)):
+        for o in ["All", "★ Favoriten"] + sorted(list(groups)):
             lbl = f"{o} ({counts.get(o, 0)})"; item = Gtk.MenuItem(label=f"• {lbl}" if o == self.current_group else lbl)
             item.connect("activate", self.on_group_selected, o); self.group_menu.append(item)
         self.group_menu.show_all()
@@ -211,20 +195,19 @@ class MPVGTKManager(Gtk.Window):
         new_path = path_res.get("data", "") if path_res else ""
         new_pause = pause_res.get("data", False) if pause_res else False
         if new_path != self.current_playing_path or new_pause != self.is_paused:
-            self.current_playing_path = new_path
-            self.is_paused = new_pause
+            self.current_playing_path, self.is_paused = new_path, new_pause
             self.update_playlist()
         res = self.send_command({"command": ["get_property", "media-title"]}); self.set_title(str(res.get('data')) if (res and "data" in res) else "MPV")
         return True
     def filter_func(self, model, iter, data):
         dn = model.get_value(iter, 0); name, grp, q = dn.replace("★ ", "").replace("▶ ", "").replace("⏸ ", ""), model.get_value(iter, 3), self.search_entry.get_text().lower()
-        if self.current_group == "★ Favorites":
-            with self.favorites_lock: return name in self.favorites and q in name.lower()
+        if self.current_group == "★ Favoriten":
+            with self.favorites_lock: return name.strip() in self.favorites and q in name.lower()
         return q in name.lower() if self.current_group == "All" else (grp == self.current_group and q in name.lower())
     def toggle_sort(self, mi): self.sort_mode = 1 - self.sort_mode; self.update_playlist()
     def on_load_clicked(self, mi):
-        diag = Gtk.FileChooserDialog(title="Select Playlist", parent=self, action=Gtk.FileChooserAction.OPEN)
-        diag.add_buttons("_Cancel", Gtk.ResponseType.CANCEL, "_Open", Gtk.ResponseType.OK)
+        diag = Gtk.FileChooserDialog(title="Playlist wählen", parent=self, action=Gtk.FileChooserAction.OPEN)
+        diag.add_buttons("_Abbrechen", Gtk.ResponseType.CANCEL, "_Öffnen", Gtk.ResponseType.OK)
         if diag.run() == Gtk.ResponseType.OK: self.load_playlist_file(diag.get_filename())
         diag.destroy()
     def on_clear_clicked(self, mi): self.send_command({"command": ["playlist-clear"]}); self.m3u_groups = {}; self.update_playlist()
@@ -252,17 +235,10 @@ class MPVGTKManager(Gtk.Window):
         self.m3u_groups = {}
         try:
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                last_url = ""
                 for line in f:
-                    line = line.strip()
-                    if line.startswith("#EXTINF"):
-                        m, nm = re.search(r'group-title\s*=\s*"([^"]+)"', line, re.I), re.search(r',([^,]+)$', line)
-                        title = nm.group(1).strip() if nm else "Unknown"
-                        group = m.group(1) if m else "Uncategorized"
-                        self.m3u_groups[title] = {"group": group, "filename": ""}
-                        last_url = title
-                    elif line and not line.startswith("#") and last_url:
-                        self.m3u_groups[last_url]["filename"] = line
+                    if line.strip().startswith("#EXTINF"):
+                        m, nm = re.search(r'group-title="([^"]+)"', line), re.search(r',(.+)$', line)
+                        if nm: self.m3u_groups[nm.group(1).strip()] = m.group(1) if m else "Uncategorized"
         except: pass
         self.send_command({"command": ["loadlist", path, "replace"]})
         with self.file_lock:

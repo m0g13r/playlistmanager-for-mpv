@@ -22,11 +22,8 @@ class MPVQtManager(QMainWindow):
         self.setAcceptDrops(True)
         self.setWindowTitle("MPV")
         self.socket_path = "/dev/shm/mpvsocket"
-        self.fav_file = os.path.expanduser("~/.mpv_favorites.json")
-        self.last_m3u_file = os.path.expanduser("~/.mpv_last_playlist.json")
         self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
-        with self.lock:
-            self.favorites = self.load_favs()
+        self.favorites = set()
         self.sort_mode = 0
         self.current_playing_filename = ""
         self.is_paused = False
@@ -38,11 +35,12 @@ class MPVQtManager(QMainWindow):
         self.is_updating = False
         self.resume_done = False
         self.last_file = ""
+        self.last_playlist_path = ""
+        self.load_all_data()
         self.signals = UpdateSignals()
         self.signals.finished.connect(self._finalize_update)
         self.apply_styles()
         self.ensure_mpv_running()
-        self.load_window_state()
         central = QWidget()
         self.setCentralWidget(central)
         self.vbox = QVBoxLayout(central)
@@ -151,10 +149,10 @@ class MPVQtManager(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_fab_pos()
-        self.save_config()
+        self.save_all_data()
     def moveEvent(self, event):
         super().moveEvent(event)
-        self.save_config()
+        self.save_all_data()
     def update_fab_pos(self):
         w = 32
         h = 32 if not self.sub_buttons.isVisible() else (32 + 6 + 32 + 6 + 32 + 6 + 32 + 6 + 120)
@@ -177,19 +175,7 @@ class MPVQtManager(QMainWindow):
     def switch_socket(self, path):
         self.socket_path = path
         self.update_playlist()
-    def load_favs(self):
-        try:
-            if os.path.exists(self.fav_file):
-                with open(self.fav_file, "r", encoding="utf-8") as f: return set(json.load(f))
-        except: pass
-        return set()
-    def save_favs(self):
-        with self.lock:
-            try:
-                Path(os.path.dirname(self.fav_file) or ".").mkdir(parents=True, exist_ok=True)
-                with open(self.fav_file, "w", encoding="utf-8") as f: json.dump(list(self.favorites), f)
-            except: pass
-    def load_window_state(self):
+    def load_all_data(self):
         with self.lock:
             try:
                 if os.path.exists(self.config_file):
@@ -197,22 +183,31 @@ class MPVQtManager(QMainWindow):
                         c = json.load(f)
                         self.move(c.get("x", 100), c.get("y", 100))
                         self.resize(c.get("w", 280), c.get("h", 750))
+                        self.favorites = set(c.get("favorites", []))
                         self.last_file = c.get("last_file", "")
+                        self.last_playlist_path = c.get("last_playlist_path", "")
                         self.current_group = c.get("current_group", "All")
-                else:
-                    self.resize(280, 750)
-            except: self.resize(280, 750)
-    def save_config(self):
+                        self.sort_mode = c.get("sort_mode", 0)
+            except: pass
+    def save_all_data(self):
         pr = self.send_command({"command": ["get_property", "path"]})
         cp = pr.get("data", "") if pr else self.last_file
         with self.lock:
             try:
                 Path(os.path.dirname(self.config_file) or ".").mkdir(parents=True, exist_ok=True)
                 with open(self.config_file, "w", encoding="utf-8") as f:
-                    json.dump({"x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(), "last_file": cp, "current_group": self.current_group}, f)
+                    json.dump({
+                        "x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(),
+                        "favorites": list(self.favorites),
+                        "last_file": cp,
+                        "last_playlist_path": self.last_playlist_path,
+                        "current_group": self.current_group,
+                        "sort_mode": self.sort_mode
+                    }, f)
             except: pass
     def closeEvent(self, event):
-        self.save_config(); super().closeEvent(event)
+        self.save_all_data()
+        super().closeEvent(event)
     def send_command(self, cmd, timeout=0.5):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
@@ -281,7 +276,7 @@ class MPVQtManager(QMainWindow):
             menu.addAction(lbl).triggered.connect(lambda chk=False, n=g: self.set_active_group(n))
         menu.exec(self.group_btn.mapToGlobal(QPoint(0, self.group_btn.height())))
     def set_active_group(self, name):
-        self.current_group = name; self.save_config(); self.update_playlist()
+        self.current_group = name; self.save_all_data(); self.update_playlist()
     def show_burger_menu(self):
         menu = QMenu(self)
         menu.addAction("Open Playlist").triggered.connect(self.on_load_clicked)
@@ -326,7 +321,7 @@ class MPVQtManager(QMainWindow):
         if needs_refresh: self.filter_playlist()
         res_t = self.send_command({"command": ["get_property", "media-title"]})
         self.setWindowTitle(str(res_t.get('data')) if (res_t and "data" in res_t) else "MPV")
-    def toggle_sort(self): self.sort_mode = 1 - self.sort_mode; self.update_playlist()
+    def toggle_sort(self): self.sort_mode = 1 - self.sort_mode; self.save_all_data(); self.update_playlist()
     def load_playlist_file(self, path):
         if not path or not os.path.exists(path): return
         self.m3u_groups = {}; self.url_to_group = {}
@@ -344,18 +339,14 @@ class MPVQtManager(QMainWindow):
                         self.url_to_group[line] = last_group
         except: pass
         self.send_command({"command": ["loadlist", path, "replace"]})
-        try:
-            with open(self.last_m3u_file, "w", encoding="utf-8") as f: json.dump({"path": path, "sort_mode": self.sort_mode}, f)
-        except: pass
+        self.last_playlist_path = path
+        self.save_all_data()
         QTimer.singleShot(500, self.update_playlist)
     def auto_load_last_m3u(self):
-        if os.path.exists(self.last_m3u_file):
-            try:
-                with open(self.last_m3u_file, "r", encoding="utf-8") as f:
-                    d = json.load(f); self.sort_mode = d.get("sort_mode", 0); p = d.get("path")
-                    if p: self.load_playlist_file(p); return
-            except: pass
-        self.update_playlist()
+        if self.last_playlist_path and os.path.exists(self.last_playlist_path):
+            self.load_playlist_file(self.last_playlist_path)
+        else:
+            self.update_playlist()
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls(): e.accept()
         else: e.ignore()
@@ -375,7 +366,7 @@ class MPVQtManager(QMainWindow):
                 with self.lock:
                     if name in self.favorites: self.favorites.remove(name)
                     else: self.favorites.add(name)
-                self.save_favs(); self.update_playlist()
+                self.save_all_data(); self.update_playlist()
     def on_row_activated(self, idx):
         oi = idx.data(self.USER_ROLE)
         if oi is not None: self.send_command({"command": ["set_property", "playlist-pos", oi]}); self.send_command({"command": ["set_property", "pause", False]})

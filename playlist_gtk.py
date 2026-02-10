@@ -41,8 +41,9 @@ class MPVGTKManager(Gtk.Window):
         self.filter = self.list_store.filter_new()
         self.filter.set_visible_func(self.filter_func)
         self.tree_view = Gtk.TreeView(model=self.filter, headers_visible=False)
+        self.tree_view.set_enable_search(False)
         self.tree_view.connect("button-release-event", self.on_click)
-        self.tree_view.connect("key-release-event", self.on_key_release)
+        self.tree_view.connect("key-press-event", self.on_key_press)
         r_txt = Gtk.CellRendererText(xpad=8, ypad=6, ellipsize=3)
         self.tree_view.append_column(Gtk.TreeViewColumn("Name", r_txt, text=0, weight=2, foreground=4, background=5))
         self.scrolled.add(self.tree_view)
@@ -157,28 +158,36 @@ class MPVGTKManager(Gtk.Window):
             in_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
             return (not in_group, not is_fav, x["name"].lower())
         full_sorted = sorted(items, key=sort_p, reverse=(self.sort_mode == 1))
+        for target_idx, item in enumerate(full_sorted):
+            if item["orig_idx"] != target_idx:
+                self.send_command({"command": ["playlist-move", item["orig_idx"], target_idx]})
+                for other in items:
+                    if other["orig_idx"] < item["orig_idx"] and other["orig_idx"] >= target_idx: other["orig_idx"] += 1
+                item["orig_idx"] = target_idx
         GLib.idle_add(self._finalize_update, groups, full_sorted, curr_p, paused)
     def _set_updating_false(self):
         with self.update_lock: self.is_updating = False
         return False
     def _finalize_update(self, groups, full_sorted, curr_p, paused):
         self.list_store.clear()
-        self.full_list_data, active_iter, self.current_playing_path, self.is_paused = full_sorted, None, curr_p, paused
+        self.full_list_data, self.current_playing_path, self.is_paused = full_sorted, curr_p, paused
         with self.favorites_lock: fav_copy = set(self.favorites)
         for i in full_sorted:
             is_p, is_f = i["filename"] == curr_p, i["name"] in fav_copy
             status_icon = "⏸ " if (is_p and paused) else ("▶ " if is_p else "")
             dn = status_icon + (f"★ " if is_f else "") + i['name']
             bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
-            it = self.list_store.append([dn, i["orig_idx"], w, i["group"], fg, bg, i["filename"]])
-            if is_p: active_iter = it
+            self.list_store.append([dn, i["orig_idx"], w, i["group"], fg, bg, i["filename"]])
         self.rebuild_group_menu(groups)
         self.filter.refilter()
-        if active_iter:
-            try:
-                f_path = self.filter.convert_child_path_to_path(self.list_store.get_path(active_iter))
-                if f_path: self.tree_view.get_selection().select_path(f_path)
-            except: pass
+        it = self.filter.get_iter_first()
+        while it:
+            if self.filter.get_value(it, 6) == curr_p:
+                path = self.filter.get_path(it)
+                self.tree_view.get_selection().select_path(path)
+                self.tree_view.scroll_to_cell(path, None, True, 0.5, 0.5)
+                break
+            it = self.filter.iter_next(it)
         if not self.resume_done and self.last_file_path:
             for i in full_sorted:
                 if i["filename"] == self.last_file_path:
@@ -243,10 +252,11 @@ class MPVGTKManager(Gtk.Window):
                     else: self.favorites.add(n)
                 self.save_all_data()
                 self.update_playlist()
-    def on_key_release(self, tree, event):
+    def on_key_press(self, tree, event):
         if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_space):
             model, it = tree.get_selection().get_selected()
-            if it: self.activate_row(model.get_path(it))
+            if it: self.activate_row(model.get_path(it)); return True
+        return False
     def activate_row(self, path):
         f_iter = self.filter.get_iter(path)
         if f_iter:

@@ -1,17 +1,22 @@
-import sys, socket, json, os, subprocess, re, gi, threading, glob
+import sys, socket, json, os, subprocess, re, gi, threading, glob, urllib.request
 from pathlib import Path
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GObject, GLib, Gdk
+from gi.repository import Gtk, GObject, GLib, Gdk, GdkPixbuf, Pango, PangoCairo
+import cairo
 os.environ["QT_ACCESSIBILITY"] = "0"
 class MPVGTKManager(Gtk.Window):
     def __init__(self):
         super().__init__()
         self.socket_path = "/dev/shm/mpvsocket"
         self.config_file = os.path.expanduser("~/.mpv_gtk_config.json")
-        self.favorites, self.m3u_groups, self.full_list_data = set(), {}, []
+        self.favorites, self.m3u_groups, self.full_list_data, self.m3u_logos = set(), {}, [], {}
+        self.logo_cache = {}
         self.file_lock, self.update_lock, self.favorites_lock = threading.Lock(), threading.Lock(), threading.Lock()
         self.sort_mode, self.current_playing_path, self.current_group, self.is_updating, self.resume_done, self.last_file_path, self.is_paused = 0, "", "All", False, False, "", False
         self.last_playlist_path = ""
+        self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
+        self.logo_image = Gtk.Image()
+        self.logo_popup.add(self.logo_image)
         self.apply_css()
         self.ensure_mpv_running()
         self.set_default_size(200, 750)
@@ -42,8 +47,12 @@ class MPVGTKManager(Gtk.Window):
         self.filter.set_visible_func(self.filter_func)
         self.tree_view = Gtk.TreeView(model=self.filter, headers_visible=False)
         self.tree_view.set_enable_search(False)
+        self.tree_view.set_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
         self.tree_view.connect("button-release-event", self.on_click)
         self.tree_view.connect("key-press-event", self.on_key_press)
+        self.tree_view.connect("motion-notify-event", self.on_mouse_motion)
+        self.tree_view.connect("leave-notify-event", lambda w, e: self.logo_popup.hide())
+        self.connect("leave-notify-event", lambda w, e: self.logo_popup.hide())
         r_txt = Gtk.CellRendererText(xpad=8, ypad=6, ellipsize=3)
         self.tree_view.append_column(Gtk.TreeViewColumn("Name", r_txt, text=0, weight=2, foreground=4, background=5))
         self.scrolled.add(self.tree_view)
@@ -237,7 +246,7 @@ class MPVGTKManager(Gtk.Window):
         diag.destroy()
     def on_clear_clicked(self, mi):
         self.send_command({"command": ["playlist-clear"]})
-        self.m3u_groups = {}
+        self.m3u_groups, self.m3u_logos, self.logo_cache = {}, {}, {}
         self.update_playlist()
     def on_click(self, tree, event):
         pi = tree.get_path_at_pos(int(event.x), int(event.y))
@@ -260,17 +269,92 @@ class MPVGTKManager(Gtk.Window):
     def activate_row(self, path):
         f_iter = self.filter.get_iter(path)
         if f_iter:
-            self.send_command({"command": ["set_property", "playlist-pos", self.filter.get_value(f_iter, 1)]})
+            target_idx = self.filter.get_value(f_iter, 1)
+            curr = self.send_command({"command": ["get_property", "playlist-pos"]})
+            if curr and curr.get("data") == target_idx:
+                self.send_command({"command": ["playlist-play-index", target_idx]})
+            else:
+                self.send_command({"command": ["set_property", "playlist-pos", target_idx]})
             self.send_command({"command": ["set_property", "pause", False]})
+    def on_mouse_motion(self, tree, event):
+        res = tree.get_path_at_pos(int(event.x), int(event.y))
+        if res:
+            f_iter = self.filter.get_iter(res[0])
+            name = self.filter.get_value(f_iter, 0).replace("★ ", "").replace("▶ ", "").replace("⏸ ", "").strip()
+            url = self.m3u_logos.get(name)
+            if url:
+                if url in self.logo_cache: self._show_logo(self.logo_cache[url], event.x_root, event.y_root)
+                else: threading.Thread(target=self._load_logo_async, args=(url, event.x_root, event.y_root, name), daemon=True).start()
+            else:
+                placeholder = self._get_text_placeholder(name)
+                self._show_logo(placeholder, event.x_root, event.y_root)
+            return False
+        self.logo_popup.hide()
+        return False
+    def _get_text_placeholder(self, name):
+        if name in self.logo_cache: return self.logo_cache[name]
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 60, 60)
+        ctx = cairo.Context(surface)
+        ctx.set_source_rgb(0.05, 0.05, 0.05)
+        ctx.rectangle(0, 0, 60, 60)
+        ctx.fill()
+        layout = PangoCairo.create_layout(ctx)
+        layout.set_text(name, -1)
+        layout.set_width(44 * Pango.SCALE)
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+        layout.set_alignment(Pango.Alignment.CENTER)
+        current_size = 14
+        while current_size > 5:
+            desc = Pango.FontDescription(f"Sans Bold {current_size}")
+            layout.set_font_description(desc)
+            w, h = layout.get_pixel_size()
+            if h <= 44: break
+            current_size -= 1
+        ctx.set_source_rgb(0.9, 0.9, 0.9)
+        w, h = layout.get_pixel_size()
+        ctx.move_to(8, (60-h)/2)
+        PangoCairo.show_layout(ctx, layout)
+        pb = Gdk.pixbuf_get_from_surface(surface, 0, 0, 60, 60)
+        self.logo_cache[name] = pb
+        return pb
+    def _load_logo_async(self, url, x, y, name):
+        try:
+            if url.startswith("http"):
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                data = urllib.request.urlopen(req, timeout=1).read()
+                loader = GdkPixbuf.PixbufLoader()
+                loader.write(data)
+                loader.close()
+                pb = loader.get_pixbuf()
+            else: pb = GdkPixbuf.Pixbuf.new_from_file(url)
+            if pb:
+                pb = pb.scale_simple(60, 60, GdkPixbuf.InterpType.BILINEAR)
+                black_pb = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 60, 60)
+                black_pb.fill(0x000000FF)
+                pb.composite(black_pb, 0, 0, 60, 60, 0, 0, 1.0, 1.0, GdkPixbuf.InterpType.NEAREST, 255)
+                self.logo_cache[url] = black_pb
+                GLib.idle_add(self._show_logo, black_pb, x, y)
+            else: GLib.idle_add(self._show_logo, self._get_text_placeholder(name), x, y)
+        except: GLib.idle_add(self._show_logo, self._get_text_placeholder(name), x, y)
+    def _show_logo(self, pb, x, y):
+        self.logo_image.set_from_pixbuf(pb)
+        self.logo_popup.move(x + 20, y + 10)
+        self.logo_popup.show_all()
     def load_playlist_file(self, path):
         if not path or not os.path.exists(path): return
-        self.m3u_groups = {}
+        self.m3u_groups, self.m3u_logos, self.logo_cache = {}, {}, {}
         try:
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
-                    if line.strip().startswith("#EXTINF"):
-                        m, nm = re.search(r'group-title="([^"]+)"', line), re.search(r',(.+)$', line)
-                        if nm: self.m3u_groups[nm.group(1).strip()] = m.group(1) if m else "Uncategorized"
+                    line = line.strip()
+                    if line.startswith("#EXTINF"):
+                        m = re.search(r'group-title="([^"]+)"', line)
+                        lg = re.search(r'tvg-logo="([^"]+)"', line)
+                        nm = re.search(r',(.+)$', line)
+                        if nm:
+                            clean_name = nm.group(1).strip()
+                            if m: self.m3u_groups[clean_name] = m.group(1)
+                            if lg: self.m3u_logos[clean_name] = lg.group(1)
         except: pass
         self.send_command({"command": ["loadlist", path, "replace"]})
         self.last_playlist_path = path

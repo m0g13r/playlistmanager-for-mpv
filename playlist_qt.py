@@ -6,13 +6,15 @@ import subprocess
 import re
 import threading
 import glob
+import urllib.request
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QIcon
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel, QEvent, QRect
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QIcon, QPixmap, QImage, QPainter, QFontMetrics
 os.environ["QT_ACCESSIBILITY"] = "0"
 class UpdateSignals(QObject):
     finished = Signal(object, list, str, bool)
+    logo_loaded = Signal(QPixmap, QPoint)
 class MPVQtManager(QMainWindow):
     USER_ROLE = Qt.UserRole
     def __init__(self):
@@ -30,6 +32,8 @@ class MPVQtManager(QMainWindow):
         self.current_group = "All"
         self.m3u_groups = {}
         self.url_to_group = {}
+        self.m3u_logos = {}
+        self.logo_cache = {}
         self.full_list = []
         self.group_counts = {}
         self.is_updating = False
@@ -39,6 +43,7 @@ class MPVQtManager(QMainWindow):
         self.load_all_data()
         self.signals = UpdateSignals()
         self.signals.finished.connect(self._finalize_update)
+        self.signals.logo_loaded.connect(self._show_logo_popup)
         self.apply_styles()
         self.ensure_mpv_running()
         central = QWidget()
@@ -67,7 +72,15 @@ class MPVQtManager(QMainWindow):
         self.list_model = QStandardItemModel()
         self.tree_view.setModel(self.list_model)
         self.tree_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tree_view.setMouseTracking(True)
+        self.tree_view.viewport().installEventFilter(self)
         self.vbox.addWidget(self.tree_view)
+        self.logo_label = QLabel(None)
+        self.logo_label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowTransparentForInput | Qt.WindowStaysOnTopHint)
+        self.logo_label.setFixedSize(64, 64)
+        self.logo_label.setAlignment(Qt.AlignCenter)
+        self.logo_label.setStyleSheet("background: #0d0d0d; border: 1px solid #333; border-radius: 4px;")
+        self.logo_label.setScaledContents(False)
         self.fab_container = QWidget(self)
         self.fab_layout = QVBoxLayout(self.fab_container)
         self.fab_layout.setContentsMargins(0, 0, 0, 0)
@@ -133,6 +146,75 @@ class MPVQtManager(QMainWindow):
             QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page { background: none; height: 0px; }
             QToolTip { background-color: #333; color: white; border: 1px solid #555; padding: 3px; border-radius: 4px; font-weight: bold; }
         """)
+    def eventFilter(self, source, event):
+        if source is self.tree_view.viewport():
+            if event.type() == QEvent.MouseMove:
+                idx = self.tree_view.indexAt(event.position().toPoint())
+                if idx.isValid():
+                    name = self.list_model.itemFromIndex(idx).text().replace("★ ", "").replace("▶  ", "").replace("⏸ ", "").strip()
+                    url = self.m3u_logos.get(name)
+                    pos = event.globalPosition().toPoint()
+                    if url:
+                        if url in self.logo_cache:
+                            self._show_logo_popup(self.logo_cache[url], pos)
+                        else:
+                            threading.Thread(target=self._load_logo_async, args=(url, pos, name), daemon=True).start()
+                    else:
+                        self._show_logo_popup(self._get_text_placeholder(name), pos)
+                    return False
+                else:
+                    self.logo_label.hide()
+            elif event.type() in [QEvent.Leave, QEvent.Wheel]:
+                self.logo_label.hide()
+        return super().eventFilter(source, event)
+    def _get_text_placeholder(self, name):
+        cache_key = f"txt_{name}"
+        if cache_key in self.logo_cache: return self.logo_cache[cache_key]
+        pix = QPixmap(64, 64)
+        pix.fill(QColor("#0d0d0d"))
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        painter.setPen(QColor("#e6e6e6"))
+        fs = 11
+        font = QFont("Sans Serif", fs, QFont.Bold)
+        rect = QRect(4, 4, 56, 56)
+        flags = Qt.AlignCenter | Qt.TextWordWrap
+        while fs > 5:
+            font.setPointSize(fs)
+            painter.setFont(font)
+            fm = QFontMetrics(font)
+            br = fm.boundingRect(rect, flags, name)
+            words = name.split()
+            too_wide = any(fm.horizontalAdvance(w) > rect.width() for w in words)
+            if br.height() <= rect.height() and not too_wide: break
+            fs -= 1
+        if fs <= 5: flags = Qt.AlignCenter | Qt.TextWrapAnywhere
+        painter.drawText(rect, flags, name)
+        painter.end()
+        self.logo_cache[cache_key] = pix
+        return pix
+    def _load_logo_async(self, url, pos, name):
+        try:
+            if url.startswith("http"):
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                data = urllib.request.urlopen(req, timeout=1).read()
+                img = QImage.fromData(data)
+            else:
+                img = QImage(url)
+            if not img.isNull():
+                pix = QPixmap.fromImage(img).scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.logo_cache[url] = pix
+                self.signals.logo_loaded.emit(pix, pos)
+            else:
+                self.signals.logo_loaded.emit(self._get_text_placeholder(name), pos)
+        except:
+            self.signals.logo_loaded.emit(self._get_text_placeholder(name), pos)
+    def _show_logo_popup(self, pix, pos):
+        if self.tree_view.underMouse():
+            self.logo_label.setPixmap(pix)
+            self.logo_label.move(pos.x() + 15, pos.y() + 15)
+            if self.logo_label.isHidden(): self.logo_label.show()
     def toggle_fab(self):
         self.sub_buttons.setVisible(not self.sub_buttons.isVisible())
         if self.sub_buttons.isVisible():
@@ -324,7 +406,7 @@ class MPVQtManager(QMainWindow):
     def toggle_sort(self): self.sort_mode = 1 - self.sort_mode; self.save_all_data(); self.update_playlist()
     def load_playlist_file(self, path):
         if not path or not os.path.exists(path): return
-        self.m3u_groups = {}; self.url_to_group = {}
+        self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = {}, {}, {}, {}
         try:
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 last_group = "Uncategorized"
@@ -332,9 +414,13 @@ class MPVQtManager(QMainWindow):
                     line = line.strip()
                     if line.startswith("#EXTINF"):
                         m = re.search(r'group-title="([^"]+)"', line)
+                        lg = re.search(r'tvg-logo="([^"]+)"', line)
                         last_group = m.group(1) if m else "Uncategorized"
                         nm = re.search(r',(.+)$', line)
-                        if nm: self.m3u_groups[self._normalize(nm.group(1).strip())] = last_group
+                        if nm:
+                            cn = nm.group(1).strip()
+                            self.m3u_groups[self._normalize(cn)] = last_group
+                            if lg: self.m3u_logos[cn] = lg.group(1)
                     elif line and not line.startswith("#"):
                         self.url_to_group[line] = last_group
         except: pass
@@ -369,6 +455,12 @@ class MPVQtManager(QMainWindow):
                 self.save_all_data(); self.update_playlist()
     def on_row_activated(self, idx):
         oi = idx.data(self.USER_ROLE)
-        if oi is not None: self.send_command({"command": ["set_property", "playlist-pos", oi]}); self.send_command({"command": ["set_property", "pause", False]})
+        if oi is not None:
+            curr = self.send_command({"command": ["get_property", "playlist-pos"]})
+            if curr and curr.get("data") == oi:
+                self.send_command({"command": ["playlist-play-index", oi]})
+            else:
+                self.send_command({"command": ["set_property", "playlist-pos", oi]})
+            self.send_command({"command": ["set_property", "pause", False]})
 if __name__ == "__main__":
     app = QApplication(sys.argv); win = MPVQtManager(); win.show(); sys.exit(app.exec())

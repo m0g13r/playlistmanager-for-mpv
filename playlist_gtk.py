@@ -14,6 +14,8 @@ class MPVGTKManager(Gtk.Window):
         self.file_lock, self.update_lock, self.favorites_lock = threading.Lock(), threading.Lock(), threading.Lock()
         self.sort_mode, self.current_playing_path, self.current_group, self.is_updating, self.resume_done, self.last_file_path, self.is_paused = 0, "", "All", False, False, "", False
         self.last_playlist_path = ""
+        self.show_fab_enabled = True
+        self.show_logos_enabled = True
         self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
         self.logo_popup.set_visual(self.get_screen().get_rgba_visual())
         self.logo_popup.set_app_paintable(True)
@@ -79,6 +81,7 @@ class MPVGTKManager(Gtk.Window):
         self.main_fab.connect("clicked", self.on_fab_clicked)
         self.fab_container.pack_start(self.main_fab, False, False, 0)
         self.overlay.add_overlay(self.fab_container)
+        self.fab_container.set_visible(self.show_fab_enabled)
         self.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
         self.drag_dest_add_uri_targets()
         self.connect("drag-data-received", self.on_drag_data_received)
@@ -102,8 +105,25 @@ class MPVGTKManager(Gtk.Window):
             mi.connect("activate", cb)
             self.main_menu.append(mi)
         self.main_menu.append(Gtk.SeparatorMenuItem())
+        mi_fab = Gtk.CheckMenuItem(label="Show FAB")
+        mi_fab.set_active(self.show_fab_enabled)
+        mi_fab.connect("toggled", self.toggle_fab_visibility)
+        self.main_menu.append(mi_fab)
+        mi_logos = Gtk.CheckMenuItem(label="Show Logos on Hover")
+        mi_logos.set_active(self.show_logos_enabled)
+        mi_logos.connect("toggled", self.toggle_logos_visibility)
+        self.main_menu.append(mi_logos)
+        self.main_menu.append(Gtk.SeparatorMenuItem())
         self.main_menu.append(self.socket_root_item)
         self.main_menu.show_all()
+    def toggle_fab_visibility(self, mi):
+        self.show_fab_enabled = mi.get_active()
+        self.fab_container.set_visible(self.show_fab_enabled)
+        self.save_all_data()
+    def toggle_logos_visibility(self, mi):
+        self.show_logos_enabled = mi.get_active()
+        if not self.show_logos_enabled: self.logo_popup.hide()
+        self.save_all_data()
     def refresh_sockets(self):
         for c in self.socket_submenu.get_children(): self.socket_submenu.remove(c)
         sockets = sorted(glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*"))
@@ -281,6 +301,7 @@ class MPVGTKManager(Gtk.Window):
                 self.send_command({"command": ["set_property", "playlist-pos", target_idx]})
             self.send_command({"command": ["set_property", "pause", False]})
     def on_mouse_motion(self, tree, event):
+        if not self.show_logos_enabled: return False
         res = tree.get_path_at_pos(int(event.x), int(event.y))
         if res:
             f_iter = self.filter.get_iter(res[0])
@@ -348,6 +369,7 @@ class MPVGTKManager(Gtk.Window):
             else: GLib.idle_add(self._show_logo, self._get_text_placeholder(name), x, y)
         except: GLib.idle_add(self._show_logo, self._get_text_placeholder(name), x, y)
     def _show_logo(self, pb, x, y):
+        if not self.show_logos_enabled: return
         self.logo_image.set_from_pixbuf(pb)
         self.logo_popup.move(x + 20, y + 10)
         self.logo_popup.show_all()
@@ -381,6 +403,8 @@ class MPVGTKManager(Gtk.Window):
                     self.current_group, self.last_file_path = c.get("current_group", "All"), c.get("last_playing", "")
                     self.favorites = set(c.get("favorites", []))
                     self.last_playlist_path = c.get("last_playlist_path", "")
+                    self.show_fab_enabled = c.get("show_fab", True)
+                    self.show_logos_enabled = c.get("show_logos", True)
         except: pass
     def save_all_data(self):
         try:
@@ -389,7 +413,7 @@ class MPVGTKManager(Gtk.Window):
             pos, size = self.get_position(), self.get_size()
             with self.file_lock:
                 with open(self.config_file, "w", encoding="utf-8") as f:
-                    json.dump({"x": pos[0], "y": pos[1], "w": size[0], "h": size[1], "current_group": self.current_group, "last_playing": curr, "favorites": list(self.favorites), "last_playlist_path": self.last_playlist_path}, f)
+                    json.dump({"x": pos[0], "y": pos[1], "w": size[0], "h": size[1], "current_group": self.current_group, "last_playing": curr, "favorites": list(self.favorites), "last_playlist_path": self.last_playlist_path, "show_fab": self.show_fab_enabled, "show_logos": self.show_logos_enabled}, f)
         except: pass
     def on_configure_event(self, w, e):
         self.save_all_data()

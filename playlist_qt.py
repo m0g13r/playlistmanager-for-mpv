@@ -67,6 +67,8 @@ class MPVQtManager(QMainWindow):
         self.resume_done = False
         self.last_file = ""
         self.last_playlist_path = ""
+        self.show_fab_enabled = True
+        self.show_logos_enabled = True
         self.load_all_data()
         self.signals = UpdateSignals()
         self.signals.finished.connect(self._finalize_update)
@@ -132,6 +134,7 @@ class MPVQtManager(QMainWindow):
         self.main_fab.clicked.connect(self.toggle_fab)
         self.fab_layout.addWidget(self.sub_buttons)
         self.fab_layout.addWidget(self.main_fab)
+        self.fab_container.setVisible(self.show_fab_enabled)
         self.group_btn.clicked.connect(self.show_group_menu)
         self.burger_btn.clicked.connect(self.show_burger_menu)
         self.tree_view.clicked.connect(self.on_row_activated)
@@ -170,7 +173,7 @@ class MPVQtManager(QMainWindow):
         """)
     def eventFilter(self, source, event):
         if source is self.tree_view.viewport():
-            if event.type() == QEvent.MouseMove:
+            if event.type() == QEvent.MouseMove and self.show_logos_enabled:
                 idx = self.tree_view.indexAt(event.position().toPoint())
                 if idx.isValid():
                     name = self.list_model.itemFromIndex(idx).text().replace("★ ", "").replace("▶  ", "").replace("⏸ ", "").strip()
@@ -234,7 +237,7 @@ class MPVQtManager(QMainWindow):
         except:
             self.signals.logo_loaded.emit(self._get_text_placeholder(name), pos)
     def _show_logo_popup(self, pix, pos):
-        if self.tree_view.underMouse():
+        if self.tree_view.underMouse() and self.show_logos_enabled:
             self.logo_label.setPixmap(pix)
             self.logo_label.move(pos.x() + 15, pos.y() + 15)
             if self.logo_label.isHidden(): self.logo_label.show()
@@ -293,6 +296,8 @@ class MPVQtManager(QMainWindow):
                         self.last_playlist_path = c.get("last_playlist_path", "")
                         self.current_group = c.get("current_group", "All")
                         self.sort_mode = c.get("sort_mode", 0)
+                        self.show_fab_enabled = c.get("show_fab", True)
+                        self.show_logos_enabled = c.get("show_logos", True)
             except: pass
     def save_all_data(self):
         pr = self.send_command({"command": ["get_property", "path"]})
@@ -307,7 +312,9 @@ class MPVQtManager(QMainWindow):
                         "last_file": cp,
                         "last_playlist_path": self.last_playlist_path,
                         "current_group": self.current_group,
-                        "sort_mode": self.sort_mode
+                        "sort_mode": self.sort_mode,
+                        "show_fab": self.show_fab_enabled,
+                        "show_logos": self.show_logos_enabled
                     }, f)
             except: pass
     def closeEvent(self, event):
@@ -388,6 +395,18 @@ class MPVQtManager(QMainWindow):
         menu.addAction("Toggle Sort").triggered.connect(self.toggle_sort)
         menu.addAction("Refresh").triggered.connect(self.update_playlist)
         menu.addSeparator()
+        
+        mi_fab = menu.addAction("Show FAB")
+        mi_fab.setCheckable(True)
+        mi_fab.setChecked(self.show_fab_enabled)
+        mi_fab.triggered.connect(self.toggle_fab_visibility)
+        
+        mi_logos = menu.addAction("Show Logos on Hover")
+        mi_logos.setCheckable(True)
+        mi_logos.setChecked(self.show_logos_enabled)
+        mi_logos.triggered.connect(self.toggle_logos_visibility)
+        
+        menu.addSeparator()
         sock_menu = menu.addMenu("Select Player")
         for s_path, s_label in self.available_sockets:
             lbl = f"✔ {s_label}" if s_path == self.socket_path else s_label
@@ -395,6 +414,14 @@ class MPVQtManager(QMainWindow):
         menu.addSeparator()
         menu.addAction("Clear Playlist").triggered.connect(self.on_clear_clicked)
         menu.exec(self.burger_btn.mapToGlobal(QPoint(0, self.burger_btn.height())))
+    def toggle_fab_visibility(self, checked):
+        self.show_fab_enabled = checked
+        self.fab_container.setVisible(checked)
+        self.save_all_data()
+    def toggle_logos_visibility(self, checked):
+        self.show_logos_enabled = checked
+        if not checked: self.logo_label.hide()
+        self.save_all_data()
     def filter_playlist(self):
         self.list_model.clear(); q = self.search_entry.text().lower().strip(); si = None; fav_items = []; grp_items = []
         with self.lock: fc = set(self.favorites)

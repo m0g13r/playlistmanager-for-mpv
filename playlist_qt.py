@@ -351,7 +351,7 @@ class MPVQtManager(QMainWindow):
             grp = self.url_to_group.get(fn) or self.m3u_groups.get(norm_nm) or "Uncategorized"
             gc[grp] = gc.get(grp, 0) + 1; items.append({"name": nm, "filename": fn, "orig_idx": idx, "group": grp})
         def sp(x):
-            isf = x["name"] in fc; ing = (self.current_group == "All") or (self.current_group == "★ Favorites" and isf) or (x["group"] == self.current_group); return (not ing, not isf, x["name"].lower())
+            isf = x["name"] in fc; ing = (self.current_group == "All") or (self.current_group == "★ Favorites" and isf) or (x["group"] == self.current_group); return (not isf, not ing, x["name"].lower())
         fs = sorted(items, key=sp, reverse=(self.sort_mode == 1))
         for t_idx, item in enumerate(fs):
             if item["orig_idx"] != t_idx:
@@ -396,23 +396,25 @@ class MPVQtManager(QMainWindow):
         menu.addAction("Clear Playlist").triggered.connect(self.on_clear_clicked)
         menu.exec(self.burger_btn.mapToGlobal(QPoint(0, self.burger_btn.height())))
     def filter_playlist(self):
-        self.list_model.clear(); q = self.search_entry.text().lower().strip(); si = None
+        self.list_model.clear(); q = self.search_entry.text().lower().strip(); si = None; fav_items = []; grp_items = []
         with self.lock: fc = set(self.favorites)
         for i in self.full_list:
             nm, grp, idx, fn = i["name"], i["group"], i["orig_idx"], i["filename"]; isf = nm in fc
-            if "Favorites" in self.current_group:
-                if not isf: continue
-            elif "All" not in self.current_group and grp != self.current_group: continue
+            matches_grp = (self.current_group == "All") or (self.current_group == "★ Favorites" and isf) or (grp == self.current_group)
+            if not isf and not matches_grp: continue
             if q and q not in nm.lower(): continue
             isp = (fn == self.current_playing_filename); dnm = f"★ {nm}" if isf else nm
-            if isp:
-                icon = "⏸ " if self.is_paused else "▶  "
-                dnm = f"{icon}{dnm}"
+            if isp: dnm = f"{'⏸ ' if self.is_paused else '▶  '}{dnm}"
             qi = QStandardItem(dnm); qi.setData(idx, self.USER_ROLE)
-            if isp: f = QFont(); f.setBold(True); qi.setFont(f); qi.setBackground(QColor("#3584e4")); qi.setForeground(QColor("#ffffff"))
-            self.list_model.appendRow(qi)
-            if isp: si = qi.index()
-        if si: self.tree_view.selectionModel().setCurrentIndex(si, QItemSelectionModel.ClearAndSelect); self.tree_view.scrollTo(si, QAbstractItemView.PositionAtCenter)
+            if isp: f = QFont(); f.setBold(True); qi.setFont(f); qi.setBackground(QColor("#3584e4")); qi.setForeground(QColor("#ffffff")); si = qi
+            if isf: fav_items.append(qi)
+            else: grp_items.append(qi)
+        for item in fav_items: self.list_model.appendRow(item)
+        for item in grp_items: self.list_model.appendRow(item)
+        if si:
+            idx = self.list_model.indexFromItem(si)
+            self.tree_view.selectionModel().setCurrentIndex(idx, QItemSelectionModel.ClearAndSelect)
+            self.tree_view.scrollTo(idx, QAbstractItemView.PositionAtCenter)
     def update_now_playing(self):
         res = self.send_command({"command": ["get_property", "path"]})
         ps_res = self.send_command({"command": ["get_property", "pause"]})

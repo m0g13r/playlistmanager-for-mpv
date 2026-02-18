@@ -166,8 +166,8 @@ class MPVGTKManager(Gtk.Window):
             items.append({"name": name, "filename": fn, "orig_idx": idx, "group": grp})
         def sort_p(x):
             is_fav = x["name"] in fav_copy
-            in_group = (self.current_group == "All") or (self.current_group == "★ Favorites" and is_fav) or (x["group"] == self.current_group)
-            return (not in_group, not is_fav, x["name"].lower())
+            in_group = (self.current_group == "All") or (x["group"] == self.current_group)
+            return (not is_fav, not in_group, x["name"].lower())
         full_sorted = sorted(items, key=sort_p, reverse=(self.sort_mode == 1))
         for target_idx, item in enumerate(full_sorted):
             if item["orig_idx"] != target_idx:
@@ -235,8 +235,10 @@ class MPVGTKManager(Gtk.Window):
     def filter_func(self, model, iter, data):
         dn = model.get_value(iter, 0)
         name, grp, q = dn.replace("★ ", "").replace("▶ ", "").replace("⏸ ", "").strip(), model.get_value(iter, 3), self.search_entry.get_text().lower()
-        if self.current_group == "★ Favorites":
-            with self.favorites_lock: return name in self.favorites and q in name.lower()
+        with self.favorites_lock:
+            is_fav = name in self.favorites
+        if is_fav: return q in name.lower()
+        if self.current_group == "★ Favorites": return False
         return q in name.lower() if self.current_group == "All" else (grp == self.current_group and q in name.lower())
     def toggle_sort(self, mi):
         self.sort_mode = 1 - self.sort_mode

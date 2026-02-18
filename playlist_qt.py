@@ -10,11 +10,38 @@ import urllib.request
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel, QEvent, QRect
-from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QIcon, QPixmap, QImage, QPainter, QFontMetrics
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QIcon, QPixmap, QImage, QPainter, QFontMetrics, QBrush
 os.environ["QT_ACCESSIBILITY"] = "0"
 class UpdateSignals(QObject):
     finished = Signal(object, list, str, bool)
     logo_loaded = Signal(QPixmap, QPoint)
+class LogoPopup(QLabel):
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowTransparentForInput | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(64, 64)
+        self.setAlignment(Qt.AlignCenter)
+        self.padding = 6
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QBrush(QColor(13, 13, 13, 127)))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(self.rect(), 32, 32)
+        if self.pixmap():
+            pm = self.pixmap()
+            target_rect = self.rect().adjusted(self.padding, self.padding, -self.padding, -self.padding)
+            aspect_ratio = pm.width() / pm.height()
+            w = target_rect.width()
+            h = target_rect.height()
+            if w / aspect_ratio <= h:
+                h = w / aspect_ratio
+            else:
+                w = h * aspect_ratio
+            x = target_rect.x() + (target_rect.width() - w) / 2
+            y = target_rect.y() + (target_rect.height() - h) / 2
+            painter.drawPixmap(QRect(int(x), int(y), int(w), int(h)), pm)
 class MPVQtManager(QMainWindow):
     USER_ROLE = Qt.UserRole
     def __init__(self):
@@ -75,12 +102,7 @@ class MPVQtManager(QMainWindow):
         self.tree_view.setMouseTracking(True)
         self.tree_view.viewport().installEventFilter(self)
         self.vbox.addWidget(self.tree_view)
-        self.logo_label = QLabel(None)
-        self.logo_label.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowTransparentForInput | Qt.WindowStaysOnTopHint)
-        self.logo_label.setFixedSize(64, 64)
-        self.logo_label.setAlignment(Qt.AlignCenter)
-        self.logo_label.setStyleSheet("background: #0d0d0d; border: 1px solid #333; border-radius: 4px;")
-        self.logo_label.setScaledContents(False)
+        self.logo_label = LogoPopup()
         self.fab_container = QWidget(self)
         self.fab_layout = QVBoxLayout(self.fab_container)
         self.fab_layout.setContentsMargins(0, 0, 0, 0)
@@ -171,14 +193,15 @@ class MPVQtManager(QMainWindow):
         cache_key = f"txt_{name}"
         if cache_key in self.logo_cache: return self.logo_cache[cache_key]
         pix = QPixmap(64, 64)
-        pix.fill(QColor("#0d0d0d"))
+        pix.fill(Qt.transparent)
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.TextAntialiasing)
         painter.setPen(QColor("#e6e6e6"))
         fs = 11
         font = QFont("Sans Serif", fs, QFont.Bold)
-        rect = QRect(4, 4, 56, 56)
+        p = 8
+        rect = QRect(p, p, 64-2*p, 64-2*p)
         flags = Qt.AlignCenter | Qt.TextWordWrap
         while fs > 5:
             font.setPointSize(fs)

@@ -2,7 +2,7 @@ import sys, socket, json, os, subprocess, re, gi, threading, glob, urllib.reques
 from pathlib import Path
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GObject, GLib, Gdk, GdkPixbuf, Pango, PangoCairo
-import cairo
+import cairo, math
 os.environ["QT_ACCESSIBILITY"] = "0"
 class MPVGTKManager(Gtk.Window):
     def __init__(self):
@@ -15,6 +15,8 @@ class MPVGTKManager(Gtk.Window):
         self.sort_mode, self.current_playing_path, self.current_group, self.is_updating, self.resume_done, self.last_file_path, self.is_paused = 0, "", "All", False, False, "", False
         self.last_playlist_path = ""
         self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
+        self.logo_popup.set_visual(self.get_screen().get_rgba_visual())
+        self.logo_popup.set_app_paintable(True)
         self.logo_image = Gtk.Image()
         self.logo_popup.add(self.logo_image)
         self.apply_css()
@@ -286,8 +288,7 @@ class MPVGTKManager(Gtk.Window):
                 if url in self.logo_cache: self._show_logo(self.logo_cache[url], event.x_root, event.y_root)
                 else: threading.Thread(target=self._load_logo_async, args=(url, event.x_root, event.y_root, name), daemon=True).start()
             else:
-                placeholder = self._get_text_placeholder(name)
-                self._show_logo(placeholder, event.x_root, event.y_root)
+                self._show_logo(self._get_text_placeholder(name), event.x_root, event.y_root)
             return False
         self.logo_popup.hide()
         return False
@@ -295,8 +296,8 @@ class MPVGTKManager(Gtk.Window):
         if name in self.logo_cache: return self.logo_cache[name]
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 60, 60)
         ctx = cairo.Context(surface)
-        ctx.set_source_rgb(0.05, 0.05, 0.05)
-        ctx.rectangle(0, 0, 60, 60)
+        ctx.arc(30, 30, 30, 0, 2 * math.pi)
+        ctx.set_source_rgba(0, 0, 0, 0.5)
         ctx.fill()
         layout = PangoCairo.create_layout(ctx)
         layout.set_text(name, -1)
@@ -328,12 +329,20 @@ class MPVGTKManager(Gtk.Window):
                 pb = loader.get_pixbuf()
             else: pb = GdkPixbuf.Pixbuf.new_from_file(url)
             if pb:
-                pb = pb.scale_simple(60, 60, GdkPixbuf.InterpType.BILINEAR)
-                black_pb = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 60, 60)
-                black_pb.fill(0x000000FF)
-                pb.composite(black_pb, 0, 0, 60, 60, 0, 0, 1.0, 1.0, GdkPixbuf.InterpType.NEAREST, 255)
-                self.logo_cache[url] = black_pb
-                GLib.idle_add(self._show_logo, black_pb, x, y)
+                orig_w, orig_h = pb.get_width(), pb.get_height()
+                scale = min(50 / orig_w, 50 / orig_h)
+                nw, nh = int(orig_w * scale), int(orig_h * scale)
+                pb = pb.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR)
+                surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 60, 60)
+                ctx = cairo.Context(surface)
+                ctx.arc(30, 30, 30, 0, 2 * math.pi)
+                ctx.set_source_rgba(0, 0, 0, 0.5)
+                ctx.fill()
+                Gdk.cairo_set_source_pixbuf(ctx, pb, (60 - nw) / 2, (60 - nh) / 2)
+                ctx.paint()
+                round_pb = Gdk.pixbuf_get_from_surface(surface, 0, 0, 60, 60)
+                self.logo_cache[url] = round_pb
+                GLib.idle_add(self._show_logo, round_pb, x, y)
             else: GLib.idle_add(self._show_logo, self._get_text_placeholder(name), x, y)
         except: GLib.idle_add(self._show_logo, self._get_text_placeholder(name), x, y)
     def _show_logo(self, pb, x, y):

@@ -1,0 +1,468 @@
+import sys, socket, json, os, subprocess, re, threading, glob, urllib.request
+from pathlib import Path
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel, QEvent, QRect
+from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QIcon, QPixmap, QImage, QPainter, QFontMetrics, QBrush
+
+os.environ["QT_ACCESSIBILITY"] = "0"
+
+cdef class PlaylistItem:
+    cdef public str name
+    cdef public str filename
+    cdef public int orig_idx
+    cdef public str group
+    def __init__(self, str name, str filename, int orig_idx, str group):
+        self.name = name
+        self.filename = filename
+        self.orig_idx = orig_idx
+        self.group = group
+
+class UpdateSignals(QObject):
+    finished = Signal(dict, list, str, bool)
+    logo_loaded = Signal(QPixmap, QPoint)
+
+class LogoPopup(QLabel):
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowTransparentForInput | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(64, 64)
+        self.setAlignment(Qt.AlignCenter)
+        self.padding = 6
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QBrush(QColor(13, 13, 13, 127)))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(self.rect(), 32, 32)
+        if self.pixmap():
+            pm = self.pixmap()
+            target_rect = self.rect().adjusted(self.padding, self.padding, -self.padding, -self.padding)
+            aspect_ratio = pm.width() / pm.height()
+            w = target_rect.width()
+            h = target_rect.height()
+            if w / aspect_ratio <= h: h = w / aspect_ratio
+            else: w = h * aspect_ratio
+            x = target_rect.x() + (target_rect.width() - w) / 2
+            y = target_rect.y() + (target_rect.height() - h) / 2
+            painter.drawPixmap(QRect(int(x), int(y), int(w), int(h)), pm)
+
+class MPVQtManager(QMainWindow):
+    USER_ROLE = Qt.UserRole
+    def __init__(self):
+        super().__init__()
+        self.lock = threading.Lock()
+        self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowCloseButtonHint)
+        self.setAcceptDrops(True)
+        self.setWindowTitle("MPV")
+        self.socket_path = "/dev/shm/mpvsocket"
+        self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
+        self.favorites, self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = set(), {}, {}, {}, {}
+        self.sort_mode, self.current_playing_filename, self.is_paused, self.current_group = 0, "", False, "All"
+        self.full_list, self.group_counts, self.is_updating, self.resume_done, self.last_file, self.last_playlist_path = [], {}, False, False, "", ""
+        self.show_fab_enabled, self.show_logos_enabled = True, True
+        self.load_all_data()
+        self.signals = UpdateSignals()
+        self.signals.finished.connect(self._finalize_update)
+        self.signals.logo_loaded.connect(self._show_logo_popup)
+        self.apply_styles()
+        self.ensure_mpv_running()
+        central = QWidget()
+        self.setCentralWidget(central)
+        self.vbox = QVBoxLayout(central)
+        self.vbox.setSpacing(4)
+        self.vbox.setContentsMargins(5, 5, 5, 5)
+        self.header = QHBoxLayout()
+        self.header.setSpacing(4)
+        self.search_entry = QLineEdit()
+        self.search_entry.setPlaceholderText("Search...")
+        self.search_entry.setFixedHeight(28)
+        self.search_entry.textChanged.connect(self.filter_playlist)
+        self.group_btn, self.burger_btn = QPushButton("▾"), QPushButton("≡")
+        self.group_btn.setFixedSize(28, 28)
+        self.burger_btn.setFixedSize(28, 28)
+        self.header.addWidget(self.search_entry)
+        self.header.addWidget(self.group_btn)
+        self.header.addWidget(self.burger_btn)
+        self.vbox.addLayout(self.header)
+        self.tree_view = QListView()
+        self.tree_view.setFrameShape(QFrame.NoFrame)
+        self.tree_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.tree_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.list_model = QStandardItemModel()
+        self.tree_view.setModel(self.list_model)
+        self.tree_view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tree_view.setMouseTracking(True)
+        self.tree_view.viewport().installEventFilter(self)
+        self.vbox.addWidget(self.tree_view)
+        self.logo_label = LogoPopup()
+        self.fab_container = QWidget(self)
+        self.fab_layout = QVBoxLayout(self.fab_container)
+        self.fab_layout.setContentsMargins(0, 0, 0, 0)
+        self.fab_layout.setSpacing(6)
+        self.sub_buttons = QWidget()
+        self.sub_layout = QVBoxLayout(self.sub_buttons)
+        self.sub_layout.setContentsMargins(0, 0, 0, 0)
+        self.sub_layout.setSpacing(6)
+        self.vol_slider = QSlider(Qt.Vertical)
+        self.vol_slider.setRange(0, 130)
+        self.vol_slider.setFixedSize(32, 120)
+        self.vol_slider.setObjectName("fab-vol")
+        self.vol_slider.valueChanged.connect(self.on_vol_changed)
+        self.sub_layout.addWidget(self.vol_slider)
+        for icon_name, cmd in [("media-skip-forward-symbolic", ["playlist-next"]), ("media-playback-start-symbolic", ["cycle", "pause"]), ("media-skip-backward-symbolic", ["playlist-prev"])]:
+            btn = QPushButton()
+            btn.setIcon(QIcon.fromTheme(icon_name))
+            btn.setObjectName("fab-small")
+            btn.setFixedSize(32, 32)
+            btn.clicked.connect(lambda checked=False, c=cmd: self.send_command({"command": c}))
+            self.sub_layout.addWidget(btn)
+        self.sub_buttons.setVisible(False)
+        self.main_fab = QPushButton()
+        self.main_fab.setIcon(QIcon.fromTheme("view-more-horizontal-symbolic"))
+        self.main_fab.setObjectName("fab-trigger")
+        self.main_fab.setFixedSize(32, 32)
+        self.main_fab.clicked.connect(self.toggle_fab)
+        self.fab_layout.addWidget(self.sub_buttons)
+        self.fab_layout.addWidget(self.main_fab)
+        self.fab_container.setVisible(self.show_fab_enabled)
+        self.group_btn.clicked.connect(self.show_group_menu)
+        self.burger_btn.clicked.connect(self.show_burger_menu)
+        self.tree_view.clicked.connect(self.on_row_activated)
+        self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree_view.customContextMenuRequested.connect(self.on_right_click)
+        QTimer.singleShot(0, self.auto_load_last_m3u)
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_now_playing)
+        self.timer.start(1000)
+        self.socket_timer = QTimer()
+        self.socket_timer.timeout.connect(self.refresh_sockets)
+        self.socket_timer.start(5000)
+        self.available_sockets = []
+
+    def apply_styles(self):
+        self.setStyleSheet("QMainWindow { background-color: #ffffff; } * { outline: none; } QPushButton { border: none; background-color: #f2f2f2; border-radius: 4px; color: #333; padding: 0; margin: 0; } QPushButton:hover { background-color: #e5e5e5; } QLineEdit { padding: 4px 10px; border: 1px solid #eee; border-radius: 5px; background: #f9f9f9; } QPushButton#fab-trigger { border-radius: 16px; background-color: rgba(53, 132, 228, 180); qproperty-iconSize: 20px; } QPushButton#fab-trigger:hover { background-color: rgba(53, 132, 228, 255); } QPushButton#fab-small { border-radius: 16px; background-color: rgba(60, 60, 60, 160); qproperty-iconSize: 16px; } QPushButton#fab-small:hover { background-color: rgba(80, 80, 80, 220); } QSlider#fab-vol { background: rgba(60, 60, 60, 160); border-radius: 16px; padding: 10px 0px; } QSlider::groove:vertical#fab-vol { background: rgba(255, 255, 255, 40); width: 4px; border-radius: 2px; } QSlider::handle:vertical#fab-vol { background: #3584e4; height: 12px; width: 12px; margin: 0 -4px; border-radius: 6px; } QListView { background-color: white; border: none; } QListView::item { padding: 6px 10px; border-radius: 8px; margin-bottom: 2px; } QListView::item:selected { background-color: #3584e4; color: white; } QScrollBar:vertical { border: none; background: transparent; width: 8px; margin: 0; } QScrollBar::handle:vertical { background: #ccc; border-radius: 4px; min-height: 20px; } QScrollBar::handle:vertical:hover { background: #3584e4; } QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page { background: none; height: 0px; } QToolTip { background-color: #333; color: white; border: 1px solid #555; padding: 3px; border-radius: 4px; font-weight: bold; }")
+
+    def eventFilter(self, source, event):
+        if source is self.tree_view.viewport():
+            if event.type() == QEvent.MouseMove and self.show_logos_enabled:
+                idx = self.tree_view.indexAt(event.position().toPoint())
+                if idx.isValid():
+                    name = self.list_model.itemFromIndex(idx).text().replace("★ ", "").replace("▶  ", "").replace("⏸ ", "").strip()
+                    url = self.m3u_logos.get(name)
+                    pos = event.globalPosition().toPoint()
+                    if url:
+                        if url in self.logo_cache: self._show_logo_popup(self.logo_cache[url], pos)
+                        else: threading.Thread(target=self._load_logo_async, args=(url, pos, name), daemon=True).start()
+                    else: self._show_logo_popup(self._get_text_placeholder(name), pos)
+                    return False
+                else: self.logo_label.hide()
+            elif event.type() in [QEvent.Leave, QEvent.Wheel]: self.logo_label.hide()
+        return super().eventFilter(source, event)
+
+    def _get_text_placeholder(self, name):
+        cache_key = f"txt_{name}"
+        if cache_key in self.logo_cache: return self.logo_cache[cache_key]
+        pix = QPixmap(64, 64)
+        pix.fill(Qt.transparent)
+        pnt = QPainter(pix)
+        pnt.setRenderHint(QPainter.Antialiasing)
+        pnt.setRenderHint(QPainter.TextAntialiasing)
+        pnt.setPen(QColor("#e6e6e6"))
+        fs, p, rect, flags = 11, 8, QRect(8, 8, 48, 48), Qt.AlignCenter | Qt.TextWordWrap
+        font = QFont("Sans Serif", fs, QFont.Bold)
+        while fs > 5:
+            font.setPointSize(fs)
+            pnt.setFont(font)
+            fm = QFontMetrics(font)
+            br = fm.boundingRect(rect, flags, name)
+            if br.height() <= 48 and not any(fm.horizontalAdvance(w) > 48 for w in name.split()): break
+            fs -= 1
+        pnt.drawText(rect, flags, name)
+        pnt.end()
+        self.logo_cache[cache_key] = pix
+        return pix
+
+    def _load_logo_async(self, url, pos, name):
+        try:
+            if url.startswith("http"):
+                data = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=1).read()
+                img = QImage.fromData(data)
+            else: img = QImage(url)
+            if not img.isNull():
+                pix = QPixmap.fromImage(img).scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.logo_cache[url] = pix
+                self.signals.logo_loaded.emit(pix, pos)
+            else: self.signals.logo_loaded.emit(self._get_text_placeholder(name), pos)
+        except: self.signals.logo_loaded.emit(self._get_text_placeholder(name), pos)
+
+    def _show_logo_popup(self, pix, pos):
+        if self.tree_view.underMouse() and self.show_logos_enabled:
+            self.logo_label.setPixmap(pix)
+            self.logo_label.move(pos.x() + 15, pos.y() + 15)
+            if self.logo_label.isHidden(): self.logo_label.show()
+
+    def toggle_fab(self):
+        self.sub_buttons.setVisible(not self.sub_buttons.isVisible())
+        if self.sub_buttons.isVisible():
+            res = self.send_command({"command": ["get_property", "volume"]})
+            if res and "data" in res:
+                self.vol_slider.blockSignals(True)
+                self.vol_slider.setValue(int(res["data"]))
+                self.vol_slider.blockSignals(False)
+        self.update_fab_pos()
+
+    def on_vol_changed(self, val):
+        self.send_command({"command": ["set_property", "volume", val]})
+        QToolTip.showText(self.vol_slider.mapToGlobal(QPoint(-55, 50)), f"{val}%", self.vol_slider)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_fab_pos()
+        self.save_all_data()
+
+    def update_fab_pos(self):
+        # Berechne die Höhe basierend auf dem Inhalt: Trigger(32) + Spacing(6) + SubButtons(Slider 120 + 3x Button 32 + 4x Spacing 6)
+        h = 32
+        if self.sub_buttons.isVisible():
+            h = 32 + 6 + 120 + 6 + (3 * 32) + (2 * 6) + 10 # Puffer hinzugefügt
+        self.fab_container.setFixedSize(32, h)
+        self.fab_container.move(self.width() - 52, self.height() - h - 20)
+
+    def ensure_mpv_running(self):
+        if not os.path.exists(self.socket_path): subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def refresh_sockets(self):
+        new_sockets = []
+        for s in glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*"):
+            old_p = self.socket_path
+            self.socket_path = s
+            title_res = self.send_command({"command": ["get_property", "media-title"]})
+            self.socket_path = old_p
+            new_sockets.append((s, title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)))
+        self.available_sockets = new_sockets
+
+    def send_command(self, cmd, timeout=0.5):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(timeout); c.connect(self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
+                res = b""
+                while True:
+                    chunk = c.recv(16384)
+                    if not chunk: break
+                    res += chunk
+                    if res.endswith(b"\n"): break
+                if res:
+                    for line in res.decode(errors="ignore").splitlines():
+                        try:
+                            data = json.loads(line)
+                            if any(k in data for k in ["request_id", "error", "data"]): return data
+                        except: continue
+        except: pass
+        return None
+
+    def _normalize(self, s): return re.sub(r'\W+', '', s).lower() if s else ""
+
+    def update_playlist(self):
+        if self.is_updating: return
+        self.is_updating = True
+        threading.Thread(target=self._update_thread, daemon=True).start()
+
+    def _update_thread(self):
+        res = self.send_command({"command": ["get_property", "playlist"]})
+        curr = self.send_command({"command": ["get_property", "path"]})
+        pause_res = self.send_command({"command": ["get_property", "pause"]})
+        cp, ps = (curr.get("data", "") if curr else ""), (pause_res.get("data", False) if pause_res else False)
+        if not res or "data" not in res: self.is_updating = False; return
+        
+        cdef list items = []
+        cdef dict gc = {}
+        with self.lock: fc = set(self.favorites)
+        
+        for idx, i in enumerate(res["data"]):
+            fn = i.get("filename", "")
+            nm = (i.get("title") or os.path.basename(fn)).strip()
+            grp = self.url_to_group.get(fn) or self.m3u_groups.get(self._normalize(nm)) or "Uncategorized"
+            gc[grp] = gc.get(grp, 0) + 1
+            items.append(PlaylistItem(nm, fn, idx, grp))
+            
+        cdef str cur_grp = self.current_group
+        cdef int sm = self.sort_mode
+        
+        def sp(PlaylistItem x):
+            isf = x.name in fc
+            ing = (cur_grp == "All") or (cur_grp == "★ Favorites" and isf) or (x.group == cur_grp)
+            return (not isf, not ing, x.name.lower())
+            
+        fs = sorted(items, key=sp, reverse=(sm == 1))
+        
+        cdef PlaylistItem item
+        cdef PlaylistItem o
+        for t_idx, item in enumerate(fs):
+            if item.orig_idx != t_idx:
+                self.send_command({"command": ["playlist-move", item.orig_idx, t_idx]})
+                for o in items:
+                    if o.orig_idx < item.orig_idx and o.orig_idx >= t_idx: o.orig_idx += 1
+                item.orig_idx = t_idx
+                
+        self.signals.finished.emit(gc, fs, cp, ps)
+
+    def _finalize_update(self, group_counts, full_sorted, curr_path, is_paused):
+        self.full_list, self.group_counts, self.current_playing_filename, self.is_paused = full_sorted, group_counts, curr_path or "", is_paused
+        self.filter_playlist()
+        if not self.resume_done and self.last_file:
+            for item in self.full_list:
+                if item.filename == self.last_file:
+                    self.send_command({"command": ["set_property", "playlist-pos", item.orig_idx]})
+                    self.send_command({"command": ["set_property", "pause", True]})
+                    self.resume_done = True
+                    break
+        self.is_updating = False
+
+    def show_group_menu(self):
+        menu = QMenu(self)
+        with self.lock: fc = set(self.favorites)
+        f_count = sum(1 for x in self.full_list if x.name in fc)
+        for gn, c in [("All", len(self.full_list)), ("★ Favorites", f_count)]:
+            lbl = f"{gn} ({c})"
+            if self.current_group == gn: lbl = f"• {lbl}"
+            menu.addAction(lbl).triggered.connect(lambda chk=False, n=gn: self.set_active_group(n))
+        menu.addSeparator()
+        for g in sorted(self.group_counts.keys()):
+            lbl = f"{g} ({self.group_counts[g]})"
+            if self.current_group == g: lbl = f"• {lbl}"
+            menu.addAction(lbl).triggered.connect(lambda chk=False, n=g: self.set_active_group(n))
+        menu.exec(self.group_btn.mapToGlobal(QPoint(0, 28)))
+
+    def set_active_group(self, name):
+        self.current_group = name
+        self.save_all_data()
+        self.update_playlist()
+
+    def show_burger_menu(self):
+        menu = QMenu(self)
+        for l, cb in [("Open Playlist", self.on_load_clicked), ("Toggle Sort", self.toggle_sort), ("Refresh", self.update_playlist)]:
+            menu.addAction(l).triggered.connect(cb)
+        menu.addSeparator()
+        for l, state, cb in [("Show FAB", self.show_fab_enabled, self.toggle_fab_v), ("Show Logos on Hover", self.show_logos_enabled, self.toggle_logos_v)]:
+            mi = menu.addAction(l)
+            mi.setCheckable(True); mi.setChecked(state); mi.triggered.connect(cb)
+        menu.addSeparator()
+        sm = menu.addMenu("Select Player")
+        for p, l in self.available_sockets:
+            sm.addAction(f"✔ {l}" if p == self.socket_path else l).triggered.connect(lambda chk=False, path=p: self.switch_socket(path))
+        menu.addSeparator()
+        menu.addAction("Clear Playlist").triggered.connect(self.on_clear_clicked)
+        menu.exec(self.burger_btn.mapToGlobal(QPoint(0, 28)))
+
+    def toggle_fab_v(self, chk): self.show_fab_enabled = chk; self.fab_container.setVisible(chk); self.save_all_data()
+    def toggle_logos_v(self, chk): self.show_logos_enabled = chk; self.logo_label.hide() if not chk else None; self.save_all_data()
+    def switch_socket(self, p): self.socket_path = p; self.update_playlist()
+
+    def filter_playlist(self):
+        self.list_model.clear(); q = self.search_entry.text().lower().strip(); si, fav_items, grp_items = None, [], []
+        with self.lock: fc = set(self.favorites)
+        for i in self.full_list:
+            nm, grp, idx, fn = i.name, i.group, i.orig_idx, i.filename
+            isf = nm in fc
+            if not isf and not ((self.current_group == "All") or (grp == self.current_group)): continue
+            if q and q not in nm.lower(): continue
+            isp = (fn == self.current_playing_filename)
+            dnm = (f"{'⏸ ' if self.is_paused else '▶  '}" if isp else "") + (f"★ {nm}" if isf else nm)
+            qi = QStandardItem(dnm); qi.setData(idx, self.USER_ROLE)
+            if isp:
+                f = QFont(); f.setBold(True); qi.setFont(f); qi.setBackground(QColor("#3584e4")); qi.setForeground(QColor("#ffffff")); si = qi
+            if isf: fav_items.append(qi)
+            else: grp_items.append(qi)
+        for item in fav_items + grp_items: self.list_model.appendRow(item)
+        if si:
+            idx = self.list_model.indexFromItem(si)
+            self.tree_view.selectionModel().setCurrentIndex(idx, QItemSelectionModel.ClearAndSelect)
+            self.tree_view.scrollTo(idx, QAbstractItemView.PositionAtCenter)
+
+    def update_now_playing(self):
+        res, ps_res = self.send_command({"command": ["get_property", "path"]}), self.send_command({"command": ["get_property", "pause"]})
+        nr = False
+        if res and "data" in res and res["data"] != self.current_playing_filename: self.current_playing_filename, nr = res["data"], True
+        if ps_res and "data" in ps_res and ps_res["data"] != self.is_paused: self.is_paused, nr = ps_res["data"], True
+        if nr: self.filter_playlist()
+        res_t = self.send_command({"command": ["get_property", "media-title"]})
+        self.setWindowTitle(str(res_t.get('data')) if (res_t and "data" in res_t) else "MPV")
+
+    def toggle_sort(self): self.sort_mode = 1 - self.sort_mode; self.save_all_data(); self.update_playlist()
+
+    def load_playlist_file(self, path):
+        if not path or not os.path.exists(path): return
+        self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = {}, {}, {}, {}
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                lg = "Uncategorized"
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#EXTINF"):
+                        m, logo, nm = re.search(r'group-title="([^"]+)"', line), re.search(r'tvg-logo="([^"]+)"', line), re.search(r',(.+)$', line)
+                        lg = m.group(1) if m else "Uncategorized"
+                        if nm:
+                            cn = nm.group(1).strip()
+                            self.m3u_groups[self._normalize(cn)] = lg
+                            if logo: self.m3u_logos[cn] = logo.group(1)
+                    elif line and not line.startswith("#"): self.url_to_group[line] = lg
+        except: pass
+        self.send_command({"command": ["loadlist", path, "replace"]})
+        self.last_playlist_path = path
+        self.save_all_data()
+        QTimer.singleShot(500, self.update_playlist)
+
+    def auto_load_last_m3u(self):
+        if self.last_playlist_path and os.path.exists(self.last_playlist_path): self.load_playlist_file(self.last_playlist_path)
+        else: self.update_playlist()
+
+    def dragEnterEvent(self, e): e.accept() if e.mimeData().hasUrls() else e.ignore()
+    def dropEvent(self, e):
+        urls = e.mimeData().urls()
+        if urls: self.load_playlist_file(urls[0].toLocalFile())
+
+    def on_load_clicked(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Playlist", "", "M3U (*.m3u *.m3u8);;All (*)")
+        if p: self.load_playlist_file(p)
+
+    def on_clear_clicked(self): self.send_command({"command": ["playlist-clear"]}); self.m3u_groups, self.url_to_group = {}, {}; self.update_playlist()
+
+    def on_right_click(self, pos):
+        idx = self.tree_view.indexAt(pos)
+        if idx.isValid():
+            name = self.list_model.itemFromIndex(idx).text().replace("★ ", "").replace("▶  ", "").replace("⏸ ", "").strip()
+            with self.lock:
+                if name in self.favorites: self.favorites.remove(name)
+                else: self.favorites.add(name)
+            self.save_all_data(); self.update_playlist()
+
+    def on_row_activated(self, idx):
+        oi = idx.data(self.USER_ROLE)
+        if oi is not None:
+            self.send_command({"command": ["set_property", "playlist-pos", oi]})
+            self.send_command({"command": ["set_property", "pause", False]})
+
+    def load_all_data(self):
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    c = json.load(f)
+                    self.move(c.get("x", 100), c.get("y", 100)); self.resize(c.get("w", 280), c.get("h", 750))
+                    self.favorites, self.last_file, self.last_playlist_path, self.current_group = set(c.get("favorites", [])), c.get("last_file", ""), c.get("last_playlist_path", ""), c.get("current_group", "All")
+                    self.sort_mode, self.show_fab_enabled, self.show_logos_enabled = c.get("sort_mode", 0), c.get("show_fab", True), c.get("show_logos", True)
+        except: pass
+
+    def save_all_data(self):
+        pr = self.send_command({"command": ["get_property", "path"]})
+        cp = pr.get("data", "") if pr else self.last_file
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump({"x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(), "favorites": list(self.favorites), "last_file": cp, "last_playlist_path": self.last_playlist_path, "current_group": self.current_group, "sort_mode": self.sort_mode, "show_fab": self.show_fab_enabled, "show_logos": self.show_logos_enabled}, f)
+        except: pass
+
+    def moveEvent(self, event): super().moveEvent(event); self.save_all_data()
+    def closeEvent(self, event): self.save_all_data(); super().closeEvent(event)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv); win = MPVQtManager(); win.show(); sys.exit(app.exec())

@@ -39,4 +39,4 @@ added cython gcc compiled versions .... it's like a native elf more ore less ;)
 
 .
 
-![alt text](https://raw.githubusercontent.com/m0g13r/playlistmanager-for-mpv/refs/heads/main/pic.png)
+![alt text](https://github.com/m0g13r/playlistmanager-for-mpv/blob/8882484ac4c6c48858b5cc59c64084c3833c9ec9/pic.png)

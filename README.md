@@ -7,8 +7,6 @@ start it like ....
 
 .
 
-for the elf version
-
 mpv --idle --input-ipc-server=/dev/shm/mpvsocket &
 
 while [ ! -S /dev/shm/mpvsocket ]; do sleep 0.1; done

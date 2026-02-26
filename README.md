@@ -1,5 +1,5 @@
 # playlistmanager for mpv
-a python playlistmanager for MPV
+a playlistmanager for MPV
 
 it uses ipc socket
 
@@ -22,10 +22,6 @@ right click = add to Favorites
 Toggle Sort - is also sorting the internal playlist
 
 selecting a group from dropdown sets selected group lists on top of internal playlist
-
-.
-
-added cython gcc compiled versions .... it's like a native elf more ore less ;)
 
 .
 

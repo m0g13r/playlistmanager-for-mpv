@@ -1,4 +1,4 @@
-import sys, socket, json, os, subprocess, re, threading, glob, urllib.request
+import sys, socket, json, os, subprocess, re, threading, glob, urllib.request, tempfile, time
 from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel, QEvent, QRect
@@ -294,7 +294,7 @@ class MPVQtManager(QMainWindow):
             new_sockets.append((s, title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)))
         self.available_sockets = new_sockets
 
-    def send_command(self, cmd, timeout=0.1):
+    def send_command(self, cmd, timeout=0.5):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(timeout); c.connect(self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
@@ -303,13 +303,25 @@ class MPVQtManager(QMainWindow):
                     chunk = c.recv(16384)
                     if not chunk: break
                     res += chunk
-                    if res.endswith(b"\n"): break
-                if res:
-                    for line in res.decode(errors="ignore").splitlines():
-                        try:
-                            data = json.loads(line)
-                            if any(k in data for k in ["request_id", "error", "data"]): return data
-                        except: continue
+                    lines = res.split(b"\n")
+                    if len(lines) > 1:
+                        for line in lines[:-1]:
+                            if not line.strip(): continue
+                            try:
+                                data = json.loads(line.decode(errors="ignore"))
+                                if any(k in data for k in ["request_id", "error", "data"]): return data
+                            except: continue
+                        res = lines[-1]
+        except: pass
+        return None
+
+    def send_commands_batch(self, cmds):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(1.0)
+                c.connect(self.socket_path)
+                for cmd in cmds:
+                    c.sendall(json.dumps(cmd).encode() + b"\n")
         except: pass
         return None
 
@@ -340,21 +352,39 @@ class MPVQtManager(QMainWindow):
         cdef int sm = self.sort_mode
         
         if sm != 2:
-            items.sort(key=lambda x: x.name.lower(), reverse=(sm == 1))
-            items.sort(key=lambda x: -((2 if x.name in fc else 0) + (1 if (cur_grp == "All" or (cur_grp == "★ Favorites" and x.name in fc) or x.group == cur_grp) else 0)))
-            fs = items
-        else:
-            fs = items
+            import re
+            def nkey(s): return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+            # Sort by natural key of name, with filename as stable fallback
+            items.sort(key=lambda x: (nkey(x.name), x.filename), reverse=(sm == 1))
+            # Apply Favorite/Group tiers
+            items.sort(key=lambda x: -((2 if x.name in fc else 0) + (1 if (cur_grp == "All" or (cur_grp == "★ Favorites" and fc and x.name in fc) or x.group == cur_grp) else 0)))
             
+        cdef int t_idx
         cdef PlaylistItem item
         cdef PlaylistItem o
-        for t_idx, item in enumerate(fs):
+        cdef list move_cmds = []
+        for t_idx in range(len(items)):
+            item = items[t_idx]
             if item.orig_idx != t_idx:
-                self.send_command({"command": ["playlist-move", item.orig_idx, t_idx]})
+                # If this is the currently playing file, we SKIP moving it directly.
+                # Because we move everything else to their correct positions, 
+                # this file will naturally shift to its correct target index 
+                # as a side effect of other 'playlist-move' commands.
+                if item.filename == cp:
+                    continue
+                
+                move_cmds.append({"command": ["playlist-move", item.orig_idx, t_idx]})
                 for o in items:
-                    if o.orig_idx < item.orig_idx and o.orig_idx >= t_idx: o.orig_idx += 1
+                    if o.orig_idx < item.orig_idx and o.orig_idx >= t_idx:
+                        o.orig_idx += 1
+                    elif o.orig_idx > item.orig_idx and o.orig_idx <= t_idx:
+                        o.orig_idx -= 1
                 item.orig_idx = t_idx
-        self.signals.finished.emit(gc, fs, cp, ps)
+        
+        if move_cmds:
+            self.send_commands_batch(move_cmds)
+        
+        self.signals.finished.emit(gc, items, cp, ps)
 
     def _finalize_update(self, group_counts, full_sorted, curr_path, is_paused):
         self.full_list, self.group_counts, self.current_playing_filename, self.is_paused = full_sorted, group_counts, curr_path or "", is_paused
@@ -390,7 +420,9 @@ class MPVQtManager(QMainWindow):
 
     def show_burger_menu(self):
         menu = QMenu(self)
-        for l, cb in [("Open Playlist", self.on_load_clicked), ("Toggle Sort", self.toggle_sort), ("Refresh", self.update_playlist)]:
+        sort_labels = {0: "Sort: A-Z", 1: "Sort: Z-A"}
+        current_sort_label = sort_labels.get(self.sort_mode, "Sort: A-Z")
+        for l, cb in [("Open Playlist", self.on_load_clicked), (current_sort_label, self.toggle_sort), ("Refresh", self.update_playlist)]:
             menu.addAction(l).triggered.connect(cb)
         menu.addSeparator()
         for l, state, cb in [("Show FAB", self.show_fab_enabled, self.toggle_fab_v), ("Show Logos on Hover", self.show_logos_enabled, self.toggle_logos_v)]:
@@ -440,7 +472,7 @@ class MPVQtManager(QMainWindow):
         res_t = self.send_command({"command": ["get_property", "media-title"]})
         self.setWindowTitle(str(res_t.get('data')) if (res_t and "data" in res_t) else "MPV")
 
-    def toggle_sort(self): self.sort_mode = (self.sort_mode + 1) % 3; self.save_all_data(); self.update_playlist()
+    def toggle_sort(self): self.sort_mode = 1 if self.sort_mode == 0 else 0; self.save_all_data(); self.update_playlist()
 
     def load_playlist_file(self, path, append=False):
         if not path: return
@@ -452,16 +484,25 @@ class MPVQtManager(QMainWindow):
             exts = ('.mkv', '.mp4', '.webm', '.avi', '.mov', '.flv', '.wmv', '.ts', '.m2ts', '.mts', '.vob', '.ogv', '.qt', '.rmvb', '.asf', '.amv', '.m4v', '.mpg', '.mpeg', '.m2v', '.divx', '.3gp', '.3g2',
                     '.mp3', '.flac', '.wav', '.opus', '.ogg', '.m4a', '.aac', '.alac', '.wma', '.aiff', '.dsf', '.dff', '.ape', '.wv', '.tta', '.mpc', '.mka', '.m4b',
                     '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.svg')
-            for f in glob.glob(os.path.join(path, '**', '*.*'), recursive=True):
-                if f.lower().endswith(exts): files.append(f)
-            files.sort()
-            for idx, f in enumerate(files):
-                cmd_type = "append" if (append or idx > 0) else "replace"
-                self.send_command({"command": ["loadfile", f, cmd_type]})
+            for root, dirs, fnames in os.walk(path):
+                for f in sorted(fnames):
+                    if f.lower().endswith(exts): files.append(os.path.join(root, f))
+            if files:
+                temp_m3u = ""
+                try:
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.m3u', delete=False, encoding='utf-8') as tf:
+                        tf.write('#EXTM3U\n')
+                        for f in files: tf.write(f + '\n')
+                        temp_m3u = tf.name
+                    cmd_type = "append" if append else "replace"
+                    self.send_command({"command": ["loadlist", temp_m3u, cmd_type]})
+                    QTimer.singleShot(2000, lambda: os.remove(temp_m3u) if os.path.exists(temp_m3u) else None)
+                except:
+                    if temp_m3u and os.path.exists(temp_m3u): os.remove(temp_m3u)
         else:
             pl_exts = ('.m3u', '.m3u8', '.pls', '.xspf', '.cue', '.asx', '.txt')
             cmd_type = "append" if append else "replace"
-            if not is_remote and os.path.exists(path):
+            if not is_remote and os.path.exists(path) and path.lower().split('?')[0].endswith(pl_exts):
                 try:
                     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                         lg = "Uncategorized"
@@ -482,7 +523,8 @@ class MPVQtManager(QMainWindow):
             
         if not append: self.last_playlist_path = path
         self.save_all_data()
-        QTimer.singleShot(100, self.update_playlist)
+        self.send_command({"command": ["set_property", "pause", False]})
+        QTimer.singleShot(500, self.update_playlist)
 
     def auto_load_last_m3u(self):
         if self.last_playlist_path:
@@ -523,7 +565,11 @@ class MPVQtManager(QMainWindow):
     def on_row_activated(self, idx):
         oi = idx.data(self.USER_ROLE)
         if oi is not None:
-            self.send_command({"command": ["set_property", "playlist-pos", oi]})
+            res = self.send_command({"command": ["get_property", "playlist-pos"]})
+            if res and res.get("data") == oi:
+                self.send_command({"command": ["playlist-play-index", oi]})
+            else:
+                self.send_command({"command": ["set_property", "playlist-pos", oi]})
             self.send_command({"command": ["set_property", "pause", False]})
 
     def load_all_data(self):

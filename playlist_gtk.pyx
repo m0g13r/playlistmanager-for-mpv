@@ -1,4 +1,4 @@
-import sys, socket, json, os, subprocess, re, gi, threading, glob, urllib.request
+import sys, socket, json, os, subprocess, re, gi, threading, glob, urllib.request, tempfile, time
 from pathlib import Path
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GObject, GLib, Gdk, GdkPixbuf, Pango, PangoCairo
@@ -142,7 +142,9 @@ class MPVGTKManager(Gtk.Window):
 
     def rebuild_main_menu(self):
         for c in self.main_menu.get_children(): self.main_menu.remove(c)
-        for l, cb in [("Open Playlist", self.on_load_clicked), ("Toggle Sort", self.toggle_sort), ("Refresh", lambda x: self.update_playlist()), ("Clear Playlist", self.on_clear_clicked)]:
+        sort_labels = {0: "Sort: A-Z", 1: "Sort: Z-A"}
+        current_sort_label = sort_labels.get(self.sort_mode, "Sort: A-Z")
+        for l, cb in [("Open Playlist", self.on_load_clicked), (current_sort_label, self.toggle_sort), ("Refresh", lambda x: self.update_playlist()), ("Clear Playlist", self.on_clear_clicked)]:
             mi = Gtk.MenuItem(label=l)
             mi.connect("activate", cb)
             self.main_menu.append(mi)
@@ -198,7 +200,7 @@ class MPVGTKManager(Gtk.Window):
     def send_command(self, cmd):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-                c.settimeout(0.1)
+                c.settimeout(0.5)
                 c.connect(self.socket_path)
                 c.sendall(json.dumps(cmd).encode() + b"\n")
                 res = b""
@@ -206,14 +208,25 @@ class MPVGTKManager(Gtk.Window):
                     chunk = c.recv(16384)
                     if not chunk: break
                     res += chunk
-                    if b"\n" in res: break
-                if res:
-                    for line in res.decode(errors="ignore").splitlines():
-                        if not line.strip(): continue
-                        try:
-                            data = json.loads(line)
-                            if any(k in data for k in ["request_id", "error", "data"]): return data
-                        except: continue
+                    lines = res.split(b"\n")
+                    if len(lines) > 1:
+                        for line in lines[:-1]:
+                            if not line.strip(): continue
+                            try:
+                                data = json.loads(line.decode(errors="ignore"))
+                                if any(k in data for k in ["request_id", "error", "data"]): return data
+                            except: continue
+                        res = lines[-1]
+        except: pass
+        return None
+
+    def send_commands_batch(self, cmds):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(1.0)
+                c.connect(self.socket_path)
+                for cmd in cmds:
+                    c.sendall(json.dumps(cmd).encode() + b"\n")
         except: pass
         return None
 
@@ -248,21 +261,39 @@ class MPVGTKManager(Gtk.Window):
         cdef str cur_grp = self.current_group
         
         if sm != 2:
-            items.sort(key=lambda x: x.name.lower(), reverse=(sm == 1))
+            import re
+            def nkey(s): return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+            # Sort by natural key of name, with filename as stable fallback
+            items.sort(key=lambda x: (nkey(x.name), x.filename), reverse=(sm == 1))
+            # Apply Favorite/Group tiers: favorites always top, then current group
             items.sort(key=lambda x: -((2 if x.name in fav_copy else 0) + (1 if (cur_grp == "All" or (cur_grp == "★ Favorites" and x.name in fav_copy) or x.group == cur_grp) else 0)))
-            full_sorted = items
-        else:
-            full_sorted = items
-            
+        
+        cdef int target_idx
         cdef PlaylistItem item
         cdef PlaylistItem other
-        for target_idx, item in enumerate(full_sorted):
+        cdef list move_cmds = []
+        for target_idx in range(len(items)):
+            item = items[target_idx]
             if item.orig_idx != target_idx:
-                self.send_command({"command": ["playlist-move", item.orig_idx, target_idx]})
+                # If this is the currently playing file, we SKIP moving it directly.
+                # Because we move everything else to their correct positions, 
+                # this file will naturally shift to its correct target index 
+                # as a side effect of other 'playlist-move' commands.
+                if item.filename == curr_p:
+                    continue
+                
+                move_cmds.append({"command": ["playlist-move", item.orig_idx, target_idx]})
                 for other in items:
-                    if other.orig_idx < item.orig_idx and other.orig_idx >= target_idx: other.orig_idx += 1
+                    if other.orig_idx < item.orig_idx and other.orig_idx >= target_idx:
+                        other.orig_idx += 1
+                    elif other.orig_idx > item.orig_idx and other.orig_idx <= target_idx:
+                        other.orig_idx -= 1
                 item.orig_idx = target_idx
-        GLib.idle_add(self._finalize_update, group_counts, full_sorted, curr_p, paused)
+        
+        if move_cmds:
+            self.send_commands_batch(move_cmds)
+        
+        GLib.idle_add(self._finalize_update, group_counts, items, curr_p, paused)
 
     def _set_updating_false(self):
         with self.update_lock: self.is_updating = False
@@ -350,7 +381,8 @@ class MPVGTKManager(Gtk.Window):
         return q in name.lower()
 
     def toggle_sort(self, mi):
-        self.sort_mode = (self.sort_mode + 1) % 3
+        self.sort_mode = 1 if self.sort_mode == 0 else 0
+        self.rebuild_main_menu()
         self.save_all_data()
         self.update_playlist()
 
@@ -389,7 +421,11 @@ class MPVGTKManager(Gtk.Window):
         f_iter = self.filter.get_iter(path)
         if f_iter:
             target_idx = self.filter.get_value(f_iter, 1)
-            self.send_command({"command": ["set_property", "playlist-pos", target_idx]})
+            res = self.send_command({"command": ["get_property", "playlist-pos"]})
+            if res and res.get("data") == target_idx:
+                self.send_command({"command": ["playlist-play-index", target_idx]})
+            else:
+                self.send_command({"command": ["set_property", "playlist-pos", target_idx]})
             self.send_command({"command": ["set_property", "pause", False]})
 
     def on_mouse_motion(self, tree, event):
@@ -480,16 +516,25 @@ class MPVGTKManager(Gtk.Window):
             exts = ('.mkv', '.mp4', '.webm', '.avi', '.mov', '.flv', '.wmv', '.ts', '.m2ts', '.mts', '.vob', '.ogv', '.qt', '.rmvb', '.asf', '.amv', '.m4v', '.mpg', '.mpeg', '.m2v', '.divx', '.3gp', '.3g2',
                     '.mp3', '.flac', '.wav', '.opus', '.ogg', '.m4a', '.aac', '.alac', '.wma', '.aiff', '.dsf', '.dff', '.ape', '.wv', '.tta', '.mpc', '.mka', '.m4b',
                     '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.svg')
-            for f in glob.glob(os.path.join(path, '**', '*.*'), recursive=True):
-                if f.lower().endswith(exts): files.append(f)
-            files.sort()
-            for idx, f in enumerate(files):
-                cmd_type = "append" if (append or idx > 0) else "replace"
-                self.send_command({"command": ["loadfile", f, cmd_type]})
+            for root, dirs, fnames in os.walk(path):
+                for f in sorted(fnames):
+                    if f.lower().endswith(exts): files.append(os.path.join(root, f))
+            if files:
+                temp_m3u = ""
+                try:
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.m3u', delete=False, encoding='utf-8') as tf:
+                        tf.write('#EXTM3U\n')
+                        for f in files: tf.write(f + '\n')
+                        temp_m3u = tf.name
+                    cmd_type = "append" if append else "replace"
+                    self.send_command({"command": ["loadlist", temp_m3u, cmd_type]})
+                    GLib.timeout_add(2000, lambda: (os.remove(temp_m3u) if os.path.exists(temp_m3u) else None, False)[1])
+                except:
+                    if temp_m3u and os.path.exists(temp_m3u): os.remove(temp_m3u)
         else:
             pl_exts = ('.m3u', '.m3u8', '.pls', '.xspf', '.cue', '.asx', '.txt')
             cmd_type = "append" if append else "replace"
-            if not is_remote and os.path.exists(path):
+            if not is_remote and os.path.exists(path) and path.lower().split('?')[0].endswith(pl_exts):
                 try:
                     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                         lg = "Uncategorized"
@@ -510,7 +555,8 @@ class MPVGTKManager(Gtk.Window):
             
         if not append: self.last_playlist_path = path
         self.save_all_data()
-        GLib.timeout_add(100, self.update_playlist)
+        self.send_command({"command": ["set_property", "pause", False]})
+        GLib.timeout_add(500, self.update_playlist)
 
     def load_all_data(self):
         try:

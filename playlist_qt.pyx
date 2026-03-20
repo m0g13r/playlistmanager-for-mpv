@@ -49,6 +49,7 @@ class LogoPopup(QLabel):
 
 class MPVQtManager(QMainWindow):
     USER_ROLE = Qt.UserRole
+    RAW_NAME_ROLE = Qt.UserRole + 1  # Opt #3: stores the plain name without prefix symbols
     def __init__(self):
         super().__init__()
         self.lock = threading.Lock()
@@ -61,6 +62,7 @@ class MPVQtManager(QMainWindow):
         self.sort_mode, self.current_playing_filename, self.is_paused, self.current_group = 0, "", False, "All"
         self.full_list, self.group_counts, self.is_updating, self.resume_done, self.last_file, self.last_playlist_path = [], {}, False, False, "", ""
         self.show_fab_enabled, self.show_logos_enabled = True, True
+        self.update_lock = threading.Lock()  # Opt #6: guard is_updating
         self.load_all_data()
         
         self.signals = UpdateSignals()
@@ -201,7 +203,8 @@ class MPVQtManager(QMainWindow):
             if event.type() == QEvent.MouseMove and self.show_logos_enabled:
                 idx = self.tree_view.indexAt(event.position().toPoint())
                 if idx.isValid():
-                    name = self.list_model.itemFromIndex(idx).text().replace("★ ", "").replace("▶ ", "").replace("⏸ ", "").strip()
+                    # Opt #3: read raw name from RAW_NAME_ROLE — no str.replace() needed
+                    name = self.list_model.itemFromIndex(idx).data(self.RAW_NAME_ROLE)
                     url = self.m3u_logos.get(name)
                     pos = event.globalPosition().toPoint()
                     if url:
@@ -316,6 +319,7 @@ class MPVQtManager(QMainWindow):
         return None
 
     def send_commands_batch(self, cmds):
+        """Fire-and-forget batch send (no response needed, e.g. playlist-move)."""
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(1.0)
@@ -325,9 +329,42 @@ class MPVQtManager(QMainWindow):
         except: pass
         return None
 
+    def send_commands_batch_read(self, cmds):
+        """Opt #2: Send multiple commands over ONE socket connection and collect all responses."""
+        results = [None] * len(cmds)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(1.0)
+                c.connect(self.socket_path)
+                for i, cmd in enumerate(cmds):
+                    payload = dict(cmd)
+                    payload["request_id"] = i
+                    c.sendall(json.dumps(payload).encode() + b"\n")
+                buf = b""
+                received = 0
+                while received < len(cmds):
+                    chunk = c.recv(16384)
+                    if not chunk: break
+                    buf += chunk
+                    lines = buf.split(b"\n")
+                    for line in lines[:-1]:
+                        if not line.strip(): continue
+                        try:
+                            data = json.loads(line.decode(errors="ignore"))
+                            rid = data.get("request_id")
+                            if rid is not None and 0 <= rid < len(cmds):
+                                results[rid] = data
+                                received += 1
+                        except: continue
+                    buf = lines[-1]
+        except: pass
+        return results
+
     def update_playlist(self):
-        if self.is_updating: return
-        self.is_updating = True
+        # Opt #6: guard is_updating with lock to avoid race condition
+        with self.update_lock:
+            if self.is_updating: return
+            self.is_updating = True
         threading.Thread(target=self._update_thread, daemon=True).start()
 
     def _update_thread(self):
@@ -335,7 +372,9 @@ class MPVQtManager(QMainWindow):
         curr = self.send_command({"command": ["get_property", "path"]})
         pause_res = self.send_command({"command": ["get_property", "pause"]})
         cp, ps = (curr.get("data", "") if curr else ""), (pause_res.get("data", False) if pause_res else False)
-        if not res or "data" not in res: self.is_updating = False; return
+        if not res or "data" not in res:
+            with self.update_lock: self.is_updating = False
+            return
         
         cdef list items = []
         cdef dict gc = {}
@@ -352,12 +391,18 @@ class MPVQtManager(QMainWindow):
         cdef int sm = self.sort_mode
         
         if sm != 2:
-            import re
+            # Opt #1+#4: single sort pass — no redundant import re (already top-level)
             def nkey(s): return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
-            # Sort by natural key of name, with filename as stable fallback
-            items.sort(key=lambda x: (nkey(x.name), x.filename), reverse=(sm == 1))
-            # Apply Favorite/Group tiers
-            items.sort(key=lambda x: -((2 if x.name in fc else 0) + (1 if (cur_grp == "All" or (cur_grp == "★ Favorites" and fc and x.name in fc) or x.group == cur_grp) else 0)))
+            def sort_key(x):
+                tier = -((2 if x.name in fc else 0) +
+                         (1 if (cur_grp == "All" or
+                               (cur_grp == "★ Favorites" and x.name in fc) or
+                               x.group == cur_grp) else 0))
+                name_key = nkey(x.name)
+                if sm == 1:
+                    name_key = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in name_key]
+                return (tier, name_key, x.filename)
+            items.sort(key=sort_key)
             
         cdef int t_idx
         cdef PlaylistItem item
@@ -396,7 +441,7 @@ class MPVQtManager(QMainWindow):
                     self.send_command({"command": ["set_property", "pause", True]})
                     self.resume_done = True
                     break
-        self.is_updating = False
+        with self.update_lock: self.is_updating = False  # Opt #6
 
     def show_group_menu(self):
         menu = QMenu(self)
@@ -441,6 +486,8 @@ class MPVQtManager(QMainWindow):
     def switch_socket(self, p): self.socket_path = p; self.update_playlist()
 
     def filter_playlist(self):
+        # Opt #5: filter_playlist runs on main thread — a snapshot copy is sufficient,
+        # no lock needed during iteration itself.
         self.list_model.clear(); q = self.search_entry.text().lower().strip(); si = None
         with self.lock: fc = set(self.favorites)
         for i in self.full_list:
@@ -451,7 +498,9 @@ class MPVQtManager(QMainWindow):
             if q and q not in nm.lower(): continue
             isp = (fn == self.current_playing_filename)
             dnm = (f"{'⏸ ' if self.is_paused else '▶ '}" if isp else "") + (f"★ {nm}" if isf else nm)
-            qi = QStandardItem(dnm); qi.setData(idx, self.USER_ROLE)
+            qi = QStandardItem(dnm)
+            qi.setData(idx, self.USER_ROLE)
+            qi.setData(nm, self.RAW_NAME_ROLE)  # Opt #3: store raw name for O(1) lookup
             if isp:
                 f = QFont(); f.setBold(True); qi.setFont(f); qi.setBackground(QColor("#3584e4")); qi.setForeground(QColor("#ffffff")); si = qi
             self.list_model.appendRow(qi)
@@ -461,16 +510,20 @@ class MPVQtManager(QMainWindow):
             self.tree_view.scrollTo(idx, QAbstractItemView.PositionAtCenter)
 
     def update_now_playing(self):
-        path_res = self.send_command({"command": ["get_property", "path"]})
-        pause_res = self.send_command({"command": ["get_property", "pause"]})
+        # Opt #2: fetch path, pause, media-title in ONE socket connection
+        results = self.send_commands_batch_read([
+            {"command": ["get_property", "path"]},
+            {"command": ["get_property", "pause"]},
+            {"command": ["get_property", "media-title"]},
+        ])
+        path_res, pause_res, title_res = results
         new_path = path_res.get("data", "") if path_res else ""
         new_pause = pause_res.get("data", False) if pause_res else False
         if new_path != self.current_playing_filename or new_pause != self.is_paused:
             self.current_playing_filename = new_path
             self.is_paused = new_pause
             self.update_playlist()
-        res_t = self.send_command({"command": ["get_property", "media-title"]})
-        self.setWindowTitle(str(res_t.get('data')) if (res_t and "data" in res_t) else "MPV")
+        self.setWindowTitle(str(title_res.get('data')) if (title_res and "data" in title_res) else "MPV")
 
     def toggle_sort(self): self.sort_mode = 1 if self.sort_mode == 0 else 0; self.save_all_data(); self.update_playlist()
 
@@ -556,7 +609,8 @@ class MPVQtManager(QMainWindow):
     def on_right_click(self, pos):
         idx = self.tree_view.indexAt(pos)
         if idx.isValid():
-            name = self.list_model.itemFromIndex(idx).text().replace("★ ", "").replace("▶ ", "").replace("⏸ ", "").strip()
+            # Opt #3: read raw name from RAW_NAME_ROLE — no str.replace() needed
+            name = self.list_model.itemFromIndex(idx).data(self.RAW_NAME_ROLE)
             with self.lock:
                 if name in self.favorites: self.favorites.remove(name)
                 else: self.favorites.add(name)

@@ -67,7 +67,9 @@ class MPVGTKManager(Gtk.Window):
         self.scrolled = Gtk.ScrolledWindow()
         self.overlay.add(self.scrolled)
         
-        self.list_store = Gtk.ListStore(str, int, int, str, str, str, str)
+        # Columns: 0=display_name, 1=orig_idx, 2=weight, 3=group, 4=fg, 5=bg, 6=filename, 7=raw_name
+        self.list_store = Gtk.ListStore(str, int, int, str, str, str, str, str)
+        self.filter_cached_favs = set()  # Opt #6: lock-free cache for filter_func
         self.filter = self.list_store.filter_new()
         self.filter.set_visible_func(self.filter_func)
         self.tree_view = Gtk.TreeView(model=self.filter, headers_visible=False)
@@ -80,7 +82,7 @@ class MPVGTKManager(Gtk.Window):
         self.connect("leave-notify-event", lambda w, e: self.logo_popup.hide())
         
         r_txt = Gtk.CellRendererText(xpad=8, ypad=6, ellipsize=3)
-        self.tree_view.append_column(Gtk.TreeViewColumn("Name", r_txt, text=0, weight=2, foreground=4, background=5))
+        self.tree_view.append_column(Gtk.TreeViewColumn("Name", r_txt, text=0, weight=2, foreground=4, background=5))  # col 7 (raw_name) is invisible
         self.scrolled.add(self.tree_view)
         
         self.fab_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.END, valign=Gtk.Align.END, margin_bottom=25, margin_right=25)
@@ -221,6 +223,7 @@ class MPVGTKManager(Gtk.Window):
         return None
 
     def send_commands_batch(self, cmds):
+        """Send multiple commands; returns None (fire-and-forget for playlist moves)."""
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(1.0)
@@ -229,6 +232,37 @@ class MPVGTKManager(Gtk.Window):
                     c.sendall(json.dumps(cmd).encode() + b"\n")
         except: pass
         return None
+
+    def send_commands_batch_read(self, cmds):
+        """Opt #2: Send multiple commands over ONE socket connection and collect responses."""
+        results = [None] * len(cmds)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(1.0)
+                c.connect(self.socket_path)
+                for i, cmd in enumerate(cmds):
+                    payload = dict(cmd)
+                    payload["request_id"] = i
+                    c.sendall(json.dumps(payload).encode() + b"\n")
+                buf = b""
+                received = 0
+                while received < len(cmds):
+                    chunk = c.recv(16384)
+                    if not chunk: break
+                    buf += chunk
+                    lines = buf.split(b"\n")
+                    for line in lines[:-1]:
+                        if not line.strip(): continue
+                        try:
+                            data = json.loads(line.decode(errors="ignore"))
+                            rid = data.get("request_id")
+                            if rid is not None and 0 <= rid < len(cmds):
+                                results[rid] = data
+                                received += 1
+                        except: continue
+                    buf = lines[-1]
+        except: pass
+        return results
 
     def update_playlist(self):
         with self.update_lock:
@@ -261,12 +295,20 @@ class MPVGTKManager(Gtk.Window):
         cdef str cur_grp = self.current_group
         
         if sm != 2:
-            import re
+            # Opt #1: single sort pass — combine priority tier + natural key
             def nkey(s): return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
-            # Sort by natural key of name, with filename as stable fallback
-            items.sort(key=lambda x: (nkey(x.name), x.filename), reverse=(sm == 1))
-            # Apply Favorite/Group tiers: favorites always top, then current group
-            items.sort(key=lambda x: -((2 if x.name in fav_copy else 0) + (1 if (cur_grp == "All" or (cur_grp == "★ Favorites" and x.name in fav_copy) or x.group == cur_grp) else 0)))
+            def sort_key(x):
+                tier = -((2 if x.name in fav_copy else 0) +
+                         (1 if (cur_grp == "All" or
+                               (cur_grp == "★ Favorites" and x.name in fav_copy) or
+                               x.group == cur_grp) else 0))
+                name_key = nkey(x.name)
+                if sm == 1:
+                    # Invert natural key for descending; tier stays ascending (most-favored first)
+                    # Wrap strings so they sort reversed correctly
+                    name_key = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in name_key]
+                return (tier, name_key, x.filename)
+            items.sort(key=sort_key)
         
         cdef int target_idx
         cdef PlaylistItem item
@@ -303,27 +345,35 @@ class MPVGTKManager(Gtk.Window):
         self.list_store.clear()
         self.full_list_data, self.current_playing_path, self.is_paused = full_sorted, curr_p, paused
         with self.favorites_lock: fav_copy = set(self.favorites)
+        # Opt #6: update cached favorites for lock-free filter_func calls
+        self.filter_cached_favs = fav_copy
         
         cdef PlaylistItem item_obj
+        active_store_path = None  # Opt #4: track while filling, avoid O(n) post-scan
         for item_obj in full_sorted:
             is_p = (item_obj.filename == curr_p)
             is_f = (item_obj.name in fav_copy)
             status_icon = "⏸ " if (is_p and paused) else ("▶ " if is_p else "")
             dn = status_icon + ("★ " if is_f else "") + item_obj.name
             bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
-            self.list_store.append([dn, item_obj.orig_idx, w, item_obj.group, fg, bg, item_obj.filename])
+            # Col 7: raw name without any prefix symbols (Opt #3)
+            self.list_store.append([dn, item_obj.orig_idx, w, item_obj.group, fg, bg, item_obj.filename, item_obj.name])
+            if is_p:
+                active_store_path = len(self.list_store) - 1  # store row index
             
         self.rebuild_group_menu(group_counts)
+        # Opt #6: set fresh favorites snapshot before refilter so filter_func needs no lock
         self.filter.refilter()
         
-        it = self.filter.get_iter_first()
-        while it:
-            if self.filter.get_value(it, 6) == curr_p:
-                path = self.filter.get_path(it)
-                self.tree_view.get_selection().select_path(path)
-                self.tree_view.scroll_to_cell(path, None, True, 0.5, 0.5)
-                break
-            it = self.filter.iter_next(it)
+        # Opt #4: use the row index we recorded during fill instead of linear scan
+        if active_store_path is not None:
+            store_iter = self.list_store.iter_nth_child(None, active_store_path)
+            if store_iter:
+                filter_path = self.filter.convert_child_path_to_path(
+                    self.list_store.get_path(store_iter))
+                if filter_path:
+                    self.tree_view.get_selection().select_path(filter_path)
+                    self.tree_view.scroll_to_cell(filter_path, None, True, 0.5, 0.5)
             
         if not self.resume_done and self.last_file_path:
             for item_obj in full_sorted:
@@ -361,21 +411,26 @@ class MPVGTKManager(Gtk.Window):
         self.update_playlist()
 
     def update_now_playing(self):
-        path_res = self.send_command({"command": ["get_property", "path"]})
-        pause_res = self.send_command({"command": ["get_property", "pause"]})
+        # Opt #2: fetch path, pause, media-title in ONE socket connection
+        results = self.send_commands_batch_read([
+            {"command": ["get_property", "path"]},
+            {"command": ["get_property", "pause"]},
+            {"command": ["get_property", "media-title"]},
+        ])
+        path_res, pause_res, title_res = results
         new_path = path_res.get("data", "") if path_res else ""
         new_pause = pause_res.get("data", False) if pause_res else False
         if new_path != self.current_playing_path or new_pause != self.is_paused: self.update_playlist()
-        res = self.send_command({"command": ["get_property", "media-title"]})
-        self.set_title(str(res.get('data')) if (res and "data" in res) else "MPV")
+        self.set_title(str(title_res.get('data')) if (title_res and "data" in title_res) else "MPV")
         return True
 
     def filter_func(self, model, iter, data):
-        dn = model.get_value(iter, 0)
+        # Opt #3: col 7 is the raw name (no prefix symbols) — no string manipulation needed
+        # Opt #6: use pre-snapshot favorites, no lock required here
+        name = model.get_value(iter, 7)
         grp = model.get_value(iter, 3)
         q = self.search_entry.get_text().lower()
-        name = dn.replace("★ ", "").replace("▶ ", "").replace("⏸ ", "").strip()
-        with self.favorites_lock: is_fav = name in self.favorites
+        is_fav = name in self.filter_cached_favs
         if not is_fav and not ((self.current_group == "All") or (grp == self.current_group)): return False
         if self.current_group == "★ Favorites" and not is_fav: return False
         return q in name.lower()
@@ -404,7 +459,8 @@ class MPVGTKManager(Gtk.Window):
         elif event.button == 3:
             f_iter = self.filter.get_iter(pi[0])
             if f_iter:
-                n = self.filter.get_value(f_iter, 0).replace("★ ", "").replace("▶ ", "").replace("⏸ ", "").strip()
+                # Opt #3: use col 7 (raw_name) directly
+                n = self.filter.get_value(f_iter, 7)
                 with self.favorites_lock:
                     if n in self.favorites: self.favorites.remove(n)
                     else: self.favorites.add(n)
@@ -433,7 +489,8 @@ class MPVGTKManager(Gtk.Window):
         res = tree.get_path_at_pos(int(event.x), int(event.y))
         if res:
             f_iter = self.filter.get_iter(res[0])
-            name = self.filter.get_value(f_iter, 0).replace("★ ", "").replace("▶ ", "").replace("⏸ ", "").strip()
+            # Opt #3: use col 7 (raw_name) directly — no string replace needed
+            name = self.filter.get_value(f_iter, 7)
             url = self.m3u_logos.get(name)
             if url:
                 if url in self.logo_cache: self._show_logo(self.logo_cache[url], event.x_root, event.y_root)

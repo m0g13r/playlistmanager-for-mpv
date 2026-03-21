@@ -31,6 +31,7 @@ class MPVGTKManager(Gtk.Window):
         self.available_sockets = []
         
         self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
+        self._re_nonword = re.compile(r'\W+')
         self.logo_popup.set_visual(self.get_screen().get_rgba_visual())
         self.logo_popup.set_app_paintable(True)
         self.logo_image = Gtk.Image()
@@ -47,7 +48,11 @@ class MPVGTKManager(Gtk.Window):
         self.set_titlebar(hb)
         
         self.search_entry = Gtk.SearchEntry(placeholder_text="Search...", hexpand=True, width_chars=1)
-        self.search_entry.connect("changed", lambda w: self.filter.refilter())
+        self.current_search_query = ""
+        def on_search_changed(w):
+            self.current_search_query = self.search_entry.get_text().lower()
+            self.filter.refilter()
+        self.search_entry.connect("changed", on_search_changed)
         hb.set_custom_title(self.search_entry)
         
         self.menu_button, self.group_button = Gtk.MenuButton(label="≡"), Gtk.MenuButton(label="▾")
@@ -67,8 +72,8 @@ class MPVGTKManager(Gtk.Window):
         self.scrolled = Gtk.ScrolledWindow()
         self.overlay.add(self.scrolled)
         
-        # Columns: 0=display_name, 1=orig_idx, 2=weight, 3=group, 4=fg, 5=bg, 6=filename, 7=raw_name
-        self.list_store = Gtk.ListStore(str, int, int, str, str, str, str, str)
+        # Columns: 0=display_name, 1=orig_idx, 2=weight, 3=group, 4=fg, 5=bg, 6=filename, 7=raw_name, 8=raw_name_lower
+        self.list_store = Gtk.ListStore(str, int, int, str, str, str, str, str, str)
         self.filter_cached_favs = set()  # Opt #6: lock-free cache for filter_func
         self.filter = self.list_store.filter_new()
         self.filter.set_visible_func(self.filter_func)
@@ -131,7 +136,7 @@ class MPVGTKManager(Gtk.Window):
         GLib.timeout_add(1000, self.update_now_playing)
         GLib.timeout_add(5000, self.refresh_sockets)
 
-    def _normalize(self, s): return re.sub(r'\W+', '', s).lower() if s else ""
+    def _normalize(self, s): return self._re_nonword.sub('', s).lower() if s else ""
 
     def apply_css(self):
         css = b".compact-header { min-height: 24px; padding: 0; } .compact-header button { padding: 1px 2px; min-height: 20px; min-width: 20px; } .compact-header entry { min-height: 20px; margin: 2px 0; } .fab-button { border-radius: 50%; border: none; padding: 0; transition: all 150ms ease; box-shadow: none; } .fab-trigger { min-width: 32px; min-height: 32px; background: rgba(53, 132, 228, 0.7); color: white; } .fab-trigger:hover { background: rgba(53, 132, 228, 0.9); } .fab-small { min-width: 28px; min-height: 28px; background: rgba(60, 60, 60, 0.6); color: white; } .fab-small:hover { background: rgba(80, 80, 80, 0.8); } .fab-shuffle { min-width: 28px; min-height: 28px; background: rgba(60, 60, 60, 0.6); color: #444444; } .fab-shuffle:hover { background: rgba(80, 80, 80, 0.8); } .fab-vol-slider { background: rgba(60, 60, 60, 0.6); border-radius: 14px; padding: 12px 0; } scale.fab-vol-slider contents trough { background: rgba(255, 255, 255, 0.2); min-width: 4px; border-radius: 2px; margin: 0 12px; } scale.fab-vol-slider contents trough highlight { background: #3584e4; border-radius: 2px; } scale.fab-vol-slider contents trough slider { background: #3584e4; min-width: 12px; min-height: 12px; border-radius: 50%; margin: -4px; border: none; box-shadow: none; } treeview { background-color: transparent; } treeview selection { border-radius: 8px; } treeview:selected { border-radius: 8px; background-color: #3584e4; color: white; }"
@@ -271,9 +276,14 @@ class MPVGTKManager(Gtk.Window):
         threading.Thread(target=self._update_thread, daemon=True).start()
 
     def _update_thread(self):
-        res = self.send_command({"command": ["get_property", "playlist"]})
-        path_res = self.send_command({"command": ["get_property", "path"]})
-        pause_res = self.send_command({"command": ["get_property", "pause"]})
+        results = self.send_commands_batch_read([
+            {"command": ["get_property", "playlist"]},
+            {"command": ["get_property", "path"]},
+            {"command": ["get_property", "pause"]}
+        ])
+        res = results[0] if results and len(results) > 0 else None
+        path_res = results[1] if results and len(results) > 1 else None
+        pause_res = results[2] if results and len(results) > 2 else None
         curr_p = path_res.get("data", "") if path_res else ""
         paused = pause_res.get("data", False) if pause_res else False
         if not res or "data" not in res:
@@ -357,7 +367,8 @@ class MPVGTKManager(Gtk.Window):
             dn = status_icon + ("★ " if is_f else "") + item_obj.name
             bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
             # Col 7: raw name without any prefix symbols (Opt #3)
-            self.list_store.append([dn, item_obj.orig_idx, w, item_obj.group, fg, bg, item_obj.filename, item_obj.name])
+            # Col 8: lowercased raw name for fast filter checks
+            self.list_store.append([dn, item_obj.orig_idx, w, item_obj.group, fg, bg, item_obj.filename, item_obj.name, item_obj.name.lower()])
             if is_p:
                 active_store_path = len(self.list_store) - 1  # store row index
             
@@ -425,15 +436,16 @@ class MPVGTKManager(Gtk.Window):
         return True
 
     def filter_func(self, model, iter, data):
-        # Opt #3: col 7 is the raw name (no prefix symbols) — no string manipulation needed
+        # Opt #3: col 7 is the raw name (no prefix symbols)
         # Opt #6: use pre-snapshot favorites, no lock required here
         name = model.get_value(iter, 7)
         grp = model.get_value(iter, 3)
-        q = self.search_entry.get_text().lower()
         is_fav = name in self.filter_cached_favs
         if not is_fav and not ((self.current_group == "All") or (grp == self.current_group)): return False
         if self.current_group == "★ Favorites" and not is_fav: return False
-        return q in name.lower()
+        if not self.current_search_query: return True
+        name_lower = model.get_value(iter, 8)
+        return self.current_search_query in name_lower
 
     def toggle_sort(self, mi):
         self.sort_mode = 1 if self.sort_mode == 0 else 0
@@ -593,12 +605,17 @@ class MPVGTKManager(Gtk.Window):
             cmd_type = "append" if append else "replace"
             if not is_remote and os.path.exists(path) and path.lower().split('?')[0].endswith(pl_exts):
                 try:
+                    re_group = re.compile(r'group-title="([^"]+)"')
+                    re_logo = re.compile(r'tvg-logo="([^"]+)"')
+                    re_name = re.compile(r',(.+)$')
                     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                         lg = "Uncategorized"
                         for line in f:
                             line = line.strip()
                             if line.startswith("#EXTINF"):
-                                m, logo, nm = re.search(r'group-title="([^"]+)"', line), re.search(r'tvg-logo="([^"]+)"', line), re.search(r',(.+)$', line)
+                                m = re_group.search(line)
+                                logo = re_logo.search(line)
+                                nm = re_name.search(line)
                                 lg = m.group(1) if m else "Uncategorized"
                                 if nm:
                                     cn = nm.group(1).strip()

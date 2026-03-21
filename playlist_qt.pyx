@@ -8,11 +8,13 @@ os.environ["QT_ACCESSIBILITY"] = "0"
 
 cdef class PlaylistItem:
     cdef public str name
+    cdef public str name_lower
     cdef public str filename
     cdef public int orig_idx
     cdef public str group
     def __init__(self, str name, str filename, int orig_idx, str group):
         self.name = name
+        self.name_lower = name.lower()
         self.filename = filename
         self.orig_idx = orig_idx
         self.group = group
@@ -58,6 +60,7 @@ class MPVQtManager(QMainWindow):
         self.setWindowTitle("MPV")
         self.socket_path = "/dev/shm/mpvsocket"
         self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
+        self._re_nonword = re.compile(r'\W+')
         self.favorites, self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = set(), {}, {}, {}, {}
         self.sort_mode, self.current_playing_filename, self.is_paused, self.current_group = 0, "", False, "All"
         self.full_list, self.group_counts, self.is_updating, self.resume_done, self.last_file, self.last_playlist_path = [], {}, False, False, "", ""
@@ -160,7 +163,7 @@ class MPVQtManager(QMainWindow):
         self.socket_timer.start(5000)
         self.available_sockets = []
 
-    def _normalize(self, s): return re.sub(r'\W+', '', s).lower() if s else ""
+    def _normalize(self, s): return self._re_nonword.sub('', s).lower() if s else ""
 
     def on_shuffle_clicked(self, checked=False):
         self.sort_mode = 2
@@ -368,9 +371,14 @@ class MPVQtManager(QMainWindow):
         threading.Thread(target=self._update_thread, daemon=True).start()
 
     def _update_thread(self):
-        res = self.send_command({"command": ["get_property", "playlist"]})
-        curr = self.send_command({"command": ["get_property", "path"]})
-        pause_res = self.send_command({"command": ["get_property", "pause"]})
+        results = self.send_commands_batch_read([
+            {"command": ["get_property", "playlist"]},
+            {"command": ["get_property", "path"]},
+            {"command": ["get_property", "pause"]}
+        ])
+        res = results[0] if results and len(results) > 0 else None
+        curr = results[1] if results and len(results) > 1 else None
+        pause_res = results[2] if results and len(results) > 2 else None
         cp, ps = (curr.get("data", "") if curr else ""), (pause_res.get("data", False) if pause_res else False)
         if not res or "data" not in res:
             with self.update_lock: self.is_updating = False
@@ -495,7 +503,7 @@ class MPVQtManager(QMainWindow):
             isf = nm in fc
             if not isf and not ((self.current_group == "All") or (grp == self.current_group)): continue
             if self.current_group == "★ Favorites" and not isf: continue
-            if q and q not in nm.lower(): continue
+            if q and q not in i.name_lower: continue
             isp = (fn == self.current_playing_filename)
             dnm = (f"{'⏸ ' if self.is_paused else '▶ '}" if isp else "") + (f"★ {nm}" if isf else nm)
             qi = QStandardItem(dnm)
@@ -557,12 +565,17 @@ class MPVQtManager(QMainWindow):
             cmd_type = "append" if append else "replace"
             if not is_remote and os.path.exists(path) and path.lower().split('?')[0].endswith(pl_exts):
                 try:
+                    re_group = re.compile(r'group-title="([^"]+)"')
+                    re_logo = re.compile(r'tvg-logo="([^"]+)"')
+                    re_name = re.compile(r',(.+)$')
                     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                         lg = "Uncategorized"
                         for line in f:
                             line = line.strip()
                             if line.startswith("#EXTINF"):
-                                m, logo, nm = re.search(r'group-title="([^"]+)"', line), re.search(r'tvg-logo="([^"]+)"', line), re.search(r',(.+)$', line)
+                                m = re_group.search(line)
+                                logo = re_logo.search(line)
+                                nm = re_name.search(line)
                                 lg = m.group(1) if m else "Uncategorized"
                                 if nm:
                                     cn = nm.group(1).strip()

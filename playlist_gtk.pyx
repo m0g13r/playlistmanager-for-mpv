@@ -10,11 +10,13 @@ cdef class PlaylistItem:
     cdef public str filename
     cdef public int orig_idx
     cdef public str group
-    def __init__(self, str name, str filename, int orig_idx, str group):
+    cdef public list nkey
+    def __init__(self, str name, str filename, int orig_idx, str group, list nkey):
         self.name = name
         self.filename = filename
         self.orig_idx = orig_idx
         self.group = group
+        self.nkey = nkey
 
 class MPVGTKManager(Gtk.Window):
     def __init__(self):
@@ -28,10 +30,12 @@ class MPVGTKManager(Gtk.Window):
         self.last_playlist_path = ""
         self.show_fab_enabled = True
         self.show_logos_enabled = True
+        self.is_probing_sockets = False
         self.available_sockets = []
         
         self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
         self._re_nonword = re.compile(r'\W+')
+        self._re_digit = re.compile(r'(\d+)')
         self.logo_popup.set_visual(self.get_screen().get_rgba_visual())
         self.logo_popup.set_app_paintable(True)
         self.logo_image = Gtk.Image()
@@ -138,6 +142,8 @@ class MPVGTKManager(Gtk.Window):
 
     def _normalize(self, s): return self._re_nonword.sub('', s).lower() if s else ""
 
+    def _get_nkey(self, s): return [int(t) if t.isdigit() else t.lower() for t in self._re_digit.split(s)]
+
     def apply_css(self):
         css = b".compact-header { min-height: 24px; padding: 0; } .compact-header button { padding: 1px 2px; min-height: 20px; min-width: 20px; } .compact-header entry { min-height: 20px; margin: 2px 0; } .fab-button { border-radius: 50%; border: none; padding: 0; transition: all 150ms ease; box-shadow: none; } .fab-trigger { min-width: 32px; min-height: 32px; background: rgba(53, 132, 228, 0.7); color: white; } .fab-trigger:hover { background: rgba(53, 132, 228, 0.9); } .fab-small { min-width: 28px; min-height: 28px; background: rgba(60, 60, 60, 0.6); color: white; } .fab-small:hover { background: rgba(80, 80, 80, 0.8); } .fab-shuffle { min-width: 28px; min-height: 28px; background: rgba(60, 60, 60, 0.6); color: #444444; } .fab-shuffle:hover { background: rgba(80, 80, 80, 0.8); } .fab-vol-slider { background: rgba(60, 60, 60, 0.6); border-radius: 14px; padding: 12px 0; } scale.fab-vol-slider contents trough { background: rgba(255, 255, 255, 0.2); min-width: 4px; border-radius: 2px; margin: 0 12px; } scale.fab-vol-slider contents trough highlight { background: #3584e4; border-radius: 2px; } scale.fab-vol-slider contents trough slider { background: #3584e4; min-width: 12px; min-height: 12px; border-radius: 50%; margin: -4px; border: none; box-shadow: none; } treeview { background-color: transparent; } treeview selection { border-radius: 8px; } treeview:selected { border-radius: 8px; background-color: #3584e4; color: white; }"
         p = Gtk.CssProvider()
@@ -179,18 +185,28 @@ class MPVGTKManager(Gtk.Window):
         self.save_all_data()
 
     def refresh_sockets(self):
-        sockets = sorted(glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*"))
-        new_available = []
-        for s in sockets:
-            old_path = self.socket_path
-            self.socket_path = s
-            title_res = self.send_command({"command": ["get_property", "media-title"]})
-            self.socket_path = old_path
-            label = title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)
-            new_available.append((s, label))
-        self.available_sockets = new_available
-        self.rebuild_socket_menu()
+        if self.is_probing_sockets: return True
+        self.is_probing_sockets = True
+        def _bg_probe():
+            try:
+                sockets = sorted(glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*"))
+                new_available = []
+                for s in sockets:
+                    old_path = self.socket_path
+                    self.socket_path = s
+                    title_res = self.send_command({"command": ["get_property", "media-title"]})
+                    self.socket_path = old_path
+                    label = title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)
+                    new_available.append((s, label))
+                GLib.idle_add(self._apply_socket_refresh, new_available)
+            finally:
+                self.is_probing_sockets = False
+        threading.Thread(target=_bg_probe, daemon=True).start()
         return True
+
+    def _apply_socket_refresh(self, new_list):
+        self.available_sockets = new_list
+        self.rebuild_socket_menu()
 
     def rebuild_socket_menu(self):
         for c in self.socket_submenu.get_children(): self.socket_submenu.remove(c)
@@ -290,57 +306,50 @@ class MPVGTKManager(Gtk.Window):
             GLib.idle_add(self._set_updating_false)
             return
             
+        cdef int i, j, n
         cdef dict group_counts = {}
         cdef list items = []
         with self.favorites_lock: fav_copy = set(self.favorites)
         
-        for idx, i in enumerate(res["data"]):
-            fn = i.get("filename", "")
-            name = (i.get("title") or os.path.basename(fn)).strip()
+        for idx, entry in enumerate(res["data"]):
+            fn = entry.get("filename", "")
+            name = (entry.get("title") or os.path.basename(fn)).strip()
             grp = self.url_to_group.get(fn) or self.m3u_groups.get(self._normalize(name)) or "Uncategorized"
             group_counts[grp] = group_counts.get(grp, 0) + 1
-            items.append(PlaylistItem(name, fn, idx, grp))
+            items.append(PlaylistItem(name, fn, idx, grp, self._get_nkey(name)))
             
         cdef int sm = self.sort_mode
         cdef str cur_grp = self.current_group
         
         if sm != 2:
-            # Opt #1: single sort pass — combine priority tier + natural key
-            def nkey(s): return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
             def sort_key(x):
                 tier = -((2 if x.name in fav_copy else 0) +
                          (1 if (cur_grp == "All" or
                                (cur_grp == "★ Favorites" and x.name in fav_copy) or
                                x.group == cur_grp) else 0))
-                name_key = nkey(x.name)
+                name_key = x.nkey
                 if sm == 1:
-                    # Invert natural key for descending; tier stays ascending (most-favored first)
-                    # Wrap strings so they sort reversed correctly
                     name_key = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in name_key]
                 return (tier, name_key, x.filename)
             items.sort(key=sort_key)
         
-        cdef int target_idx
-        cdef PlaylistItem item
-        cdef PlaylistItem other
+        cdef PlaylistItem it, ot
         cdef list move_cmds = []
-        for target_idx in range(len(items)):
-            item = items[target_idx]
-            if item.orig_idx != target_idx:
-                # If this is the currently playing file, we SKIP moving it directly.
-                # Because we move everything else to their correct positions, 
-                # this file will naturally shift to its correct target index 
-                # as a side effect of other 'playlist-move' commands.
-                if item.filename == curr_p:
-                    continue
-                
-                move_cmds.append({"command": ["playlist-move", item.orig_idx, target_idx]})
-                for other in items:
-                    if other.orig_idx < item.orig_idx and other.orig_idx >= target_idx:
-                        other.orig_idx += 1
-                    elif other.orig_idx > item.orig_idx and other.orig_idx <= target_idx:
-                        other.orig_idx -= 1
-                item.orig_idx = target_idx
+        n = len(items)
+        
+        # Optimized move simulation
+        for i in range(n):
+            it = <PlaylistItem>items[i]
+            if it.orig_idx != i:
+                move_cmds.append({"command": ["playlist-move", it.orig_idx, i]})
+                # Faster internal loop to shift original indices
+                for j in range(n):
+                    ot = <PlaylistItem>items[j]
+                    if ot.orig_idx < it.orig_idx and ot.orig_idx >= i:
+                        ot.orig_idx += 1
+                    elif ot.orig_idx > it.orig_idx and ot.orig_idx <= i:
+                        ot.orig_idx -= 1
+                it.orig_idx = i
         
         if move_cmds:
             self.send_commands_batch(move_cmds)
@@ -352,31 +361,28 @@ class MPVGTKManager(Gtk.Window):
         return False
 
     def _finalize_update(self, group_counts, list full_sorted, str curr_p, bint paused):
+        self.tree_view.set_model(None)
         self.list_store.clear()
         self.full_list_data, self.current_playing_path, self.is_paused = full_sorted, curr_p, paused
         with self.favorites_lock: fav_copy = set(self.favorites)
-        # Opt #6: update cached favorites for lock-free filter_func calls
         self.filter_cached_favs = fav_copy
         
         cdef PlaylistItem item_obj
-        active_store_path = None  # Opt #4: track while filling, avoid O(n) post-scan
+        active_store_path = None
         for item_obj in full_sorted:
             is_p = (item_obj.filename == curr_p)
             is_f = (item_obj.name in fav_copy)
             status_icon = "⏸ " if (is_p and paused) else ("▶ " if is_p else "")
             dn = status_icon + ("★ " if is_f else "") + item_obj.name
             bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
-            # Col 7: raw name without any prefix symbols (Opt #3)
-            # Col 8: lowercased raw name for fast filter checks
             self.list_store.append([dn, item_obj.orig_idx, w, item_obj.group, fg, bg, item_obj.filename, item_obj.name, item_obj.name.lower()])
             if is_p:
                 active_store_path = len(self.list_store) - 1  # store row index
             
         self.rebuild_group_menu(group_counts)
-        # Opt #6: set fresh favorites snapshot before refilter so filter_func needs no lock
+        self.tree_view.set_model(self.filter)
         self.filter.refilter()
         
-        # Opt #4: use the row index we recorded during fill instead of linear scan
         if active_store_path is not None:
             store_iter = self.list_store.iter_nth_child(None, active_store_path)
             if store_iter:

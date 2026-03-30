@@ -12,16 +12,19 @@ cdef class PlaylistItem:
     cdef public str filename
     cdef public int orig_idx
     cdef public str group
-    def __init__(self, str name, str filename, int orig_idx, str group):
+    cdef public list nkey
+    def __init__(self, str name, str filename, int orig_idx, str group, list nkey):
         self.name = name
         self.name_lower = name.lower()
         self.filename = filename
         self.orig_idx = orig_idx
         self.group = group
+        self.nkey = nkey
 
 class UpdateSignals(QObject):
     finished = Signal(dict, list, str, bool)
     logo_loaded = Signal(QPixmap, QPoint)
+    sockets_refreshed = Signal(list)
 
 class LogoPopup(QLabel):
     def __init__(self):
@@ -61,15 +64,18 @@ class MPVQtManager(QMainWindow):
         self.socket_path = "/dev/shm/mpvsocket"
         self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
         self._re_nonword = re.compile(r'\W+')
+        self._re_digit = re.compile(r'(\d+)')
         self.favorites, self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = set(), {}, {}, {}, {}
         self.sort_mode, self.current_playing_filename, self.is_paused, self.current_group = 0, "", False, "All"
         self.full_list, self.group_counts, self.is_updating, self.resume_done, self.last_file, self.last_playlist_path = [], {}, False, False, "", ""
         self.show_fab_enabled, self.show_logos_enabled = True, True
         self.update_lock = threading.Lock()  # Opt #6: guard is_updating
+        self.is_probing_sockets = False
         self.load_all_data()
         
         self.signals = UpdateSignals()
         self.signals.finished.connect(self._finalize_update)
+        self.signals.sockets_refreshed.connect(self._apply_socket_refresh)
         self.signals.logo_loaded.connect(self._show_logo_popup)
         
         self.apply_styles()
@@ -165,9 +171,13 @@ class MPVQtManager(QMainWindow):
 
     def _normalize(self, s): return self._re_nonword.sub('', s).lower() if s else ""
 
+    def _get_nkey(self, s): return [int(t) if t.isdigit() else t.lower() for t in self._re_digit.split(s)]
+
     def on_shuffle_clicked(self, checked=False):
         self.sort_mode = 2
         self.send_command({"command": ["playlist-shuffle"]})
+        self.sub_buttons.setVisible(False)
+        self.update_fab_pos()
         self.save_all_data()
         self.update_playlist()
 
@@ -291,14 +301,25 @@ class MPVQtManager(QMainWindow):
         if not os.path.exists(self.socket_path): subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
     def refresh_sockets(self):
-        new_sockets = []
-        for s in sorted(glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*")):
-            old_p = self.socket_path
-            self.socket_path = s
-            title_res = self.send_command({"command": ["get_property", "media-title"]})
-            self.socket_path = old_p
-            new_sockets.append((s, title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)))
-        self.available_sockets = new_sockets
+        if self.is_probing_sockets: return True
+        self.is_probing_sockets = True
+        def _bg_probe():
+            try:
+                new_sockets = []
+                for s in sorted(glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*")):
+                    old_p = self.socket_path
+                    self.socket_path = s
+                    title_res = self.send_command({"command": ["get_property", "media-title"]})
+                    self.socket_path = old_p
+                    new_sockets.append((s, title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)))
+                self.signals.sockets_refreshed.emit(new_sockets)
+            finally:
+                self.is_probing_sockets = False
+        threading.Thread(target=_bg_probe, daemon=True).start()
+        return True
+
+    def _apply_socket_refresh(self, new_list):
+        self.available_sockets = new_list
 
     def send_command(self, cmd, timeout=0.5):
         try:
@@ -384,55 +405,48 @@ class MPVQtManager(QMainWindow):
             with self.update_lock: self.is_updating = False
             return
         
+        cdef int i, j, n
         cdef list items = []
         cdef dict gc = {}
         with self.lock: fc = set(self.favorites)
         
-        for idx, i in enumerate(res["data"]):
-            fn = i.get("filename", "")
-            nm = (i.get("title") or os.path.basename(fn)).strip()
+        for idx, entry in enumerate(res["data"]):
+            fn = entry.get("filename", "")
+            nm = (entry.get("title") or os.path.basename(fn)).strip()
             grp = self.url_to_group.get(fn) or self.m3u_groups.get(self._normalize(nm)) or "Uncategorized"
             gc[grp] = gc.get(grp, 0) + 1
-            items.append(PlaylistItem(nm, fn, idx, grp))
+            items.append(PlaylistItem(nm, fn, idx, grp, self._get_nkey(nm)))
             
         cdef str cur_grp = self.current_group
         cdef int sm = self.sort_mode
         
         if sm != 2:
-            # Opt #1+#4: single sort pass — no redundant import re (already top-level)
-            def nkey(s): return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
             def sort_key(x):
                 tier = -((2 if x.name in fc else 0) +
                          (1 if (cur_grp == "All" or
                                (cur_grp == "★ Favorites" and x.name in fc) or
                                x.group == cur_grp) else 0))
-                name_key = nkey(x.name)
+                name_key = x.nkey
                 if sm == 1:
                     name_key = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in name_key]
                 return (tier, name_key, x.filename)
             items.sort(key=sort_key)
             
-        cdef int t_idx
-        cdef PlaylistItem item
-        cdef PlaylistItem o
+        cdef PlaylistItem it, ot
         cdef list move_cmds = []
-        for t_idx in range(len(items)):
-            item = items[t_idx]
-            if item.orig_idx != t_idx:
-                # If this is the currently playing file, we SKIP moving it directly.
-                # Because we move everything else to their correct positions, 
-                # this file will naturally shift to its correct target index 
-                # as a side effect of other 'playlist-move' commands.
-                if item.filename == cp:
-                    continue
-                
-                move_cmds.append({"command": ["playlist-move", item.orig_idx, t_idx]})
-                for o in items:
-                    if o.orig_idx < item.orig_idx and o.orig_idx >= t_idx:
-                        o.orig_idx += 1
-                    elif o.orig_idx > item.orig_idx and o.orig_idx <= t_idx:
-                        o.orig_idx -= 1
-                item.orig_idx = t_idx
+        n = len(items)
+        
+        for i in range(n):
+            it = <PlaylistItem>items[i]
+            if it.orig_idx != i:
+                move_cmds.append({"command": ["playlist-move", it.orig_idx, i]})
+                for j in range(n):
+                    ot = <PlaylistItem>items[j]
+                    if ot.orig_idx < it.orig_idx and ot.orig_idx >= i:
+                        ot.orig_idx += 1
+                    elif ot.orig_idx > it.orig_idx and ot.orig_idx <= i:
+                        ot.orig_idx -= 1
+                it.orig_idx = i
         
         if move_cmds:
             self.send_commands_batch(move_cmds)
@@ -496,6 +510,7 @@ class MPVQtManager(QMainWindow):
     def filter_playlist(self):
         # Opt #5: filter_playlist runs on main thread — a snapshot copy is sufficient,
         # no lock needed during iteration itself.
+        self.tree_view.setModel(None)
         self.list_model.clear(); q = self.search_entry.text().lower().strip(); si = None
         with self.lock: fc = set(self.favorites)
         for i in self.full_list:
@@ -512,6 +527,7 @@ class MPVQtManager(QMainWindow):
             if isp:
                 f = QFont(); f.setBold(True); qi.setFont(f); qi.setBackground(QColor("#3584e4")); qi.setForeground(QColor("#ffffff")); si = qi
             self.list_model.appendRow(qi)
+        self.tree_view.setModel(self.list_model)
         if si:
             idx = self.list_model.indexFromItem(si)
             self.tree_view.selectionModel().setCurrentIndex(idx, QItemSelectionModel.ClearAndSelect)
@@ -531,7 +547,8 @@ class MPVQtManager(QMainWindow):
             self.current_playing_filename = new_path
             self.is_paused = new_pause
             self.update_playlist()
-        self.setWindowTitle(str(title_res.get('data')) if (title_res and "data" in title_res) else "MPV")
+        if title_res and "data" in title_res:
+            self.setWindowTitle(str(title_res['data']))
 
     def toggle_sort(self): self.sort_mode = 1 if self.sort_mode == 0 else 0; self.save_all_data(); self.update_playlist()
 
@@ -657,8 +674,9 @@ class MPVQtManager(QMainWindow):
         try:
             pr = self.send_command({"command": ["get_property", "path"]})
             cp = pr.get("data", "") if pr else self.last_file
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump({"x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(), "current_group": self.current_group, "last_playing": cp, "favorites": list(self.favorites), "last_playlist_path": self.last_playlist_path, "sort_mode": self.sort_mode, "show_fab": self.show_fab_enabled, "show_logos": self.show_logos_enabled}, f)
+            with self.lock:
+                with open(self.config_file, "w", encoding="utf-8") as f:
+                    json.dump({"x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(), "current_group": self.current_group, "last_playing": cp, "favorites": list(self.favorites), "last_playlist_path": self.last_playlist_path, "sort_mode": self.sort_mode, "show_fab": self.show_fab_enabled, "show_logos": self.show_logos_enabled}, f)
         except: pass
 
     def moveEvent(self, event): super().moveEvent(event); self.save_all_data()

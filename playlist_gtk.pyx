@@ -36,7 +36,9 @@ class MPVGTKManager(Gtk.Window):
         self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
         self._re_nonword = re.compile(r'\W+')
         self._re_digit = re.compile(r'(\d+)')
-        self.logo_popup.set_visual(self.get_screen().get_rgba_visual())
+        rgba_visual = self.get_screen().get_rgba_visual()
+        if rgba_visual is not None:
+            self.logo_popup.set_visual(rgba_visual)
         self.logo_popup.set_app_paintable(True)
         self.logo_image = Gtk.Image()
         self.logo_popup.add(self.logo_image)
@@ -192,10 +194,8 @@ class MPVGTKManager(Gtk.Window):
                 sockets = sorted(glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*"))
                 new_available = []
                 for s in sockets:
-                    old_path = self.socket_path
-                    self.socket_path = s
-                    title_res = self.send_command({"command": ["get_property", "media-title"]})
-                    self.socket_path = old_path
+                    # Pass path directly — never mutate self.socket_path on a background thread.
+                    title_res = self.send_command({"command": ["get_property", "media-title"]}, path=s)
                     label = title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)
                     new_available.append((s, label))
                 GLib.idle_add(self._apply_socket_refresh, new_available)
@@ -220,11 +220,11 @@ class MPVGTKManager(Gtk.Window):
         self.socket_path = path
         self.update_playlist()
 
-    def send_command(self, cmd):
+    def send_command(self, cmd, path=None):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(0.5)
-                c.connect(self.socket_path)
+                c.connect(path or self.socket_path)
                 c.sendall(json.dumps(cmd).encode() + b"\n")
                 res = b""
                 while True:
@@ -292,6 +292,15 @@ class MPVGTKManager(Gtk.Window):
         threading.Thread(target=self._update_thread, daemon=True).start()
 
     def _update_thread(self):
+        # All cdef declarations must appear before any executable statements in Cython.
+        cdef int i, j, n
+        cdef int sm
+        cdef str cur_grp
+        cdef dict group_counts = {}
+        cdef list items = []
+        cdef list move_cmds = []
+        cdef PlaylistItem it, ot
+
         results = self.send_commands_batch_read([
             {"command": ["get_property", "playlist"]},
             {"command": ["get_property", "path"]},
@@ -305,22 +314,19 @@ class MPVGTKManager(Gtk.Window):
         if not res or "data" not in res:
             GLib.idle_add(self._set_updating_false)
             return
-            
-        cdef int i, j, n
-        cdef dict group_counts = {}
-        cdef list items = []
+
         with self.favorites_lock: fav_copy = set(self.favorites)
-        
+
         for idx, entry in enumerate(res["data"]):
             fn = entry.get("filename", "")
             name = (entry.get("title") or os.path.basename(fn)).strip()
             grp = self.url_to_group.get(fn) or self.m3u_groups.get(self._normalize(name)) or "Uncategorized"
             group_counts[grp] = group_counts.get(grp, 0) + 1
             items.append(PlaylistItem(name, fn, idx, grp, self._get_nkey(name)))
-            
-        cdef int sm = self.sort_mode
-        cdef str cur_grp = self.current_group
-        
+
+        sm = self.sort_mode
+        cur_grp = self.current_group
+
         if sm != 2:
             def sort_key(x):
                 tier = -((2 if x.name in fav_copy else 0) +
@@ -332,9 +338,8 @@ class MPVGTKManager(Gtk.Window):
                     name_key = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in name_key]
                 return (tier, name_key, x.filename)
             items.sort(key=sort_key)
-        
-        cdef PlaylistItem it, ot
-        cdef list move_cmds = []
+
+        move_cmds = []
         n = len(items)
         
         # Optimized move simulation
@@ -361,13 +366,12 @@ class MPVGTKManager(Gtk.Window):
         return False
 
     def _finalize_update(self, group_counts, list full_sorted, str curr_p, bint paused):
+        cdef PlaylistItem item_obj  # declared first — required by Cython
         self.tree_view.set_model(None)
         self.list_store.clear()
         self.full_list_data, self.current_playing_path, self.is_paused = full_sorted, curr_p, paused
         with self.favorites_lock: fav_copy = set(self.favorites)
         self.filter_cached_favs = fav_copy
-        
-        cdef PlaylistItem item_obj
         active_store_path = None
         for item_obj in full_sorted:
             is_p = (item_obj.filename == curr_p)

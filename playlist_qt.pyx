@@ -42,6 +42,7 @@ class LogoPopup(QLabel):
         painter.drawRoundedRect(self.rect(), 32, 32)
         if self.pixmap():
             pm = self.pixmap()
+            if pm.height() == 0 or pm.width() == 0: return  # guard against degenerate pixmap
             target_rect = self.rect().adjusted(self.padding, self.padding, -self.padding, -self.padding)
             aspect_ratio = pm.width() / pm.height()
             w = target_rect.width()
@@ -307,10 +308,8 @@ class MPVQtManager(QMainWindow):
             try:
                 new_sockets = []
                 for s in sorted(glob.glob("/dev/shm/mpvsocket*") + glob.glob("/tmp/mpvsocket*")):
-                    old_p = self.socket_path
-                    self.socket_path = s
-                    title_res = self.send_command({"command": ["get_property", "media-title"]})
-                    self.socket_path = old_p
+                    # Pass path directly — never mutate self.socket_path on a background thread.
+                    title_res = self.send_command({"command": ["get_property", "media-title"]}, path=s)
                     new_sockets.append((s, title_res.get("data") if (title_res and title_res.get("data")) else os.path.basename(s)))
                 self.signals.sockets_refreshed.emit(new_sockets)
             finally:
@@ -321,10 +320,10 @@ class MPVQtManager(QMainWindow):
     def _apply_socket_refresh(self, new_list):
         self.available_sockets = new_list
 
-    def send_command(self, cmd, timeout=0.5):
+    def send_command(self, cmd, timeout=0.5, path=None):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-                c.settimeout(timeout); c.connect(self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
+                c.settimeout(timeout); c.connect(path or self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
                 res = b""
                 while True:
                     chunk = c.recv(16384)
@@ -392,6 +391,15 @@ class MPVQtManager(QMainWindow):
         threading.Thread(target=self._update_thread, daemon=True).start()
 
     def _update_thread(self):
+        # All cdef declarations must appear before any executable statements in Cython.
+        cdef int i, j, n
+        cdef int sm
+        cdef str cur_grp
+        cdef list items = []
+        cdef list move_cmds = []
+        cdef dict gc = {}
+        cdef PlaylistItem it, ot
+
         results = self.send_commands_batch_read([
             {"command": ["get_property", "playlist"]},
             {"command": ["get_property", "path"]},
@@ -404,22 +412,19 @@ class MPVQtManager(QMainWindow):
         if not res or "data" not in res:
             with self.update_lock: self.is_updating = False
             return
-        
-        cdef int i, j, n
-        cdef list items = []
-        cdef dict gc = {}
+
         with self.lock: fc = set(self.favorites)
-        
+
         for idx, entry in enumerate(res["data"]):
             fn = entry.get("filename", "")
             nm = (entry.get("title") or os.path.basename(fn)).strip()
             grp = self.url_to_group.get(fn) or self.m3u_groups.get(self._normalize(nm)) or "Uncategorized"
             gc[grp] = gc.get(grp, 0) + 1
             items.append(PlaylistItem(nm, fn, idx, grp, self._get_nkey(nm)))
-            
-        cdef str cur_grp = self.current_group
-        cdef int sm = self.sort_mode
-        
+
+        cur_grp = self.current_group
+        sm = self.sort_mode
+
         if sm != 2:
             def sort_key(x):
                 tier = -((2 if x.name in fc else 0) +
@@ -431,9 +436,8 @@ class MPVQtManager(QMainWindow):
                     name_key = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in name_key]
                 return (tier, name_key, x.filename)
             items.sort(key=sort_key)
-            
-        cdef PlaylistItem it, ot
-        cdef list move_cmds = []
+
+        move_cmds = []
         n = len(items)
         
         for i in range(n):

@@ -11,12 +11,14 @@ cdef class PlaylistItem:
     cdef public int orig_idx
     cdef public str group
     cdef public list nkey
+    cdef public list nkey_rev
     def __init__(self, str name, str filename, int orig_idx, str group, list nkey):
         self.name = name
         self.filename = filename
         self.orig_idx = orig_idx
         self.group = group
         self.nkey = nkey
+        self.nkey_rev = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in nkey]
 
 class MPVGTKManager(Gtk.Window):
     def __init__(self):
@@ -25,7 +27,7 @@ class MPVGTKManager(Gtk.Window):
         self.config_file = os.path.expanduser("~/.mpv_gtk_config.json")
         self.favorites, self.m3u_groups, self.url_to_group, self.full_list_data, self.m3u_logos = set(), {}, {}, [], {}
         self.logo_cache = {}
-        self.file_lock, self.update_lock, self.favorites_lock = threading.Lock(), threading.Lock(), threading.Lock()
+        self.file_lock, self.update_lock, self.favorites_lock, self.logo_lock = threading.Lock(), threading.Lock(), threading.Lock(), threading.Lock()
         self.sort_mode, self.current_playing_path, self.current_group, self.is_updating, self.resume_done, self.last_file_path, self.is_paused = 0, "", "All", False, False, "", False
         self.last_playlist_path = ""
         self.show_fab_enabled = True
@@ -333,10 +335,7 @@ class MPVGTKManager(Gtk.Window):
                          (1 if (cur_grp == "All" or
                                (cur_grp == "★ Favorites" and x.name in fav_copy) or
                                x.group == cur_grp) else 0))
-                name_key = x.nkey
-                if sm == 1:
-                    name_key = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in name_key]
-                return (tier, name_key, x.filename)
+                return (tier, x.nkey_rev if sm == 1 else x.nkey, x.filename)
             items.sort(key=sort_key)
 
         move_cmds = []
@@ -448,14 +447,17 @@ class MPVGTKManager(Gtk.Window):
     def filter_func(self, model, iter, data):
         # Opt #3: col 7 is the raw name (no prefix symbols)
         # Opt #6: use pre-snapshot favorites, no lock required here
+        cg = self.current_group
+        sq = self.current_search_query
+        fc = self.filter_cached_favs
         name = model.get_value(iter, 7)
         grp = model.get_value(iter, 3)
-        is_fav = name in self.filter_cached_favs
-        if not is_fav and not ((self.current_group == "All") or (grp == self.current_group)): return False
-        if self.current_group == "★ Favorites" and not is_fav: return False
-        if not self.current_search_query: return True
+        is_fav = name in fc
+        if not is_fav and not (cg == "All" or grp == cg): return False
+        if cg == "★ Favorites" and not is_fav: return False
+        if not sq: return True
         name_lower = model.get_value(iter, 8)
-        return self.current_search_query in name_lower
+        return sq in name_lower
 
     def toggle_sort(self, mi):
         self.sort_mode = 1 if self.sort_mode == 0 else 0
@@ -515,7 +517,8 @@ class MPVGTKManager(Gtk.Window):
             name = self.filter.get_value(f_iter, 7)
             url = self.m3u_logos.get(name)
             if url:
-                if url in self.logo_cache: self._show_logo(self.logo_cache[url], event.x_root, event.y_root)
+                with self.logo_lock: cached = self.logo_cache.get(url)
+                if cached: self._show_logo(cached, event.x_root, event.y_root)
                 else: threading.Thread(target=self._load_logo_async, args=(url, event.x_root, event.y_root, name), daemon=True).start()
             else:
                 self._show_logo(self._get_text_placeholder(name), event.x_root, event.y_root)
@@ -574,10 +577,10 @@ class MPVGTKManager(Gtk.Window):
                 Gdk.cairo_set_source_pixbuf(ctx, pb, (60 - nw) / 2, (60 - nh) / 2)
                 ctx.paint()
                 round_pb = Gdk.pixbuf_get_from_surface(surface, 0, 0, 60, 60)
-                self.logo_cache[url] = round_pb
+                with self.logo_lock: self.logo_cache[url] = round_pb
                 GLib.idle_add(self._show_logo, round_pb, x, y)
-            else: GLib.idle_add(self._show_logo, self._get_text_placeholder(name), x, y)
-        except: GLib.idle_add(self._show_logo, self._get_text_placeholder(name), x, y)
+            else: GLib.idle_add(lambda: self._show_logo(self._get_text_placeholder(name), x, y))
+        except: GLib.idle_add(lambda: self._show_logo(self._get_text_placeholder(name), x, y))
 
     def _show_logo(self, pb, x, y):
         if not self.show_logos_enabled: return
@@ -607,7 +610,7 @@ class MPVGTKManager(Gtk.Window):
                         temp_m3u = tf.name
                     cmd_type = "append" if append else "replace"
                     self.send_command({"command": ["loadlist", temp_m3u, cmd_type]})
-                    GLib.timeout_add(2000, lambda: (os.remove(temp_m3u) if os.path.exists(temp_m3u) else None, False)[1])
+                    GLib.timeout_add(8000, lambda: (os.remove(temp_m3u) if os.path.exists(temp_m3u) else None, False)[1])
                 except:
                     if temp_m3u and os.path.exists(temp_m3u): os.remove(temp_m3u)
         else:
@@ -668,6 +671,13 @@ class MPVGTKManager(Gtk.Window):
         except: pass
 
     def on_configure_event(self, w, e):
+        if not getattr(self, '_save_pending', False):
+            self._save_pending = True
+            GLib.timeout_add(500, self._do_save)
+        return False
+
+    def _do_save(self):
+        self._save_pending = False
         self.save_all_data()
         return False
 

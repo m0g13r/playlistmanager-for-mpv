@@ -13,6 +13,7 @@ cdef class PlaylistItem:
     cdef public int orig_idx
     cdef public str group
     cdef public list nkey
+    cdef public list nkey_rev
     def __init__(self, str name, str filename, int orig_idx, str group, list nkey):
         self.name = name
         self.name_lower = name.lower()
@@ -20,10 +21,11 @@ cdef class PlaylistItem:
         self.orig_idx = orig_idx
         self.group = group
         self.nkey = nkey
+        self.nkey_rev = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in nkey]
 
 class UpdateSignals(QObject):
     finished = Signal(dict, list, str, bool)
-    logo_loaded = Signal(QPixmap, QPoint)
+    logo_loaded = Signal(object, QPoint)  # QImage for real logos, str name for placeholder
     sockets_refreshed = Signal(list)
 
 class LogoPopup(QLabel):
@@ -71,6 +73,7 @@ class MPVQtManager(QMainWindow):
         self.full_list, self.group_counts, self.is_updating, self.resume_done, self.last_file, self.last_playlist_path = [], {}, False, False, "", ""
         self.show_fab_enabled, self.show_logos_enabled = True, True
         self.update_lock = threading.Lock()  # Opt #6: guard is_updating
+        self.logo_lock = threading.Lock()  # guard logo_cache cross-thread access
         self.is_probing_sockets = False
         self.load_all_data()
         
@@ -222,7 +225,8 @@ class MPVQtManager(QMainWindow):
                     url = self.m3u_logos.get(name)
                     pos = event.globalPosition().toPoint()
                     if url:
-                        if url in self.logo_cache: self._show_logo_popup(self.logo_cache[url], pos)
+                        with self.logo_lock: cached = self.logo_cache.get(url)
+                        if cached: self._show_logo_popup(cached, pos)
                         else: threading.Thread(target=self._load_logo_async, args=(url, pos, name), daemon=True).start()
                     else: self._show_logo_popup(self._get_text_placeholder(name), pos)
                     return False
@@ -260,17 +264,22 @@ class MPVQtManager(QMainWindow):
                 img = QImage.fromData(data)
             else: img = QImage(url)
             if not img.isNull():
-                pix = QPixmap.fromImage(img).scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.logo_cache[url] = pix
-                self.signals.logo_loaded.emit(pix, pos)
-            else: self.signals.logo_loaded.emit(self._get_text_placeholder(name), pos)
-        except: self.signals.logo_loaded.emit(self._get_text_placeholder(name), pos)
+                with self.logo_lock: self.logo_cache[url] = img
+                self.signals.logo_loaded.emit(img, pos)
+            else: self.signals.logo_loaded.emit(name, pos)
+        except: self.signals.logo_loaded.emit(name, pos)
 
-    def _show_logo_popup(self, pix, pos):
-        if self.tree_view.underMouse() and self.show_logos_enabled:
-            self.logo_label.setPixmap(pix)
-            self.logo_label.move(pos.x() + 15, pos.y() + 15)
-            if self.logo_label.isHidden(): self.logo_label.show()
+    def _show_logo_popup(self, img_or_name, pos):
+        if not self.tree_view.underMouse() or not self.show_logos_enabled: return
+        if isinstance(img_or_name, str):
+            pix = self._get_text_placeholder(img_or_name)
+        elif isinstance(img_or_name, QImage):
+            pix = QPixmap.fromImage(img_or_name).scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        else:
+            pix = img_or_name  # already QPixmap (from cache hit path)
+        self.logo_label.setPixmap(pix)
+        self.logo_label.move(pos.x() + 15, pos.y() + 15)
+        if self.logo_label.isHidden(): self.logo_label.show()
 
     def toggle_fab(self):
         self.sub_buttons.setVisible(not self.sub_buttons.isVisible())
@@ -289,7 +298,19 @@ class MPVQtManager(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_fab_pos()
+        self._schedule_save()
+
+    def _schedule_save(self):
+        if not getattr(self, '_save_timer', None):
+            self._save_timer = QTimer()
+            self._save_timer.setSingleShot(True)
+            self._save_timer.timeout.connect(self._do_save)
+        self._save_timer.start(500)
+
+    def _do_save(self):
         self.save_all_data()
+
+    def moveEvent(self, event): super().moveEvent(event); self._schedule_save()
 
     def update_fab_pos(self):
         h = 32
@@ -431,10 +452,7 @@ class MPVQtManager(QMainWindow):
                          (1 if (cur_grp == "All" or
                                (cur_grp == "★ Favorites" and x.name in fc) or
                                x.group == cur_grp) else 0))
-                name_key = x.nkey
-                if sm == 1:
-                    name_key = [-v if isinstance(v, int) else ''.join(chr(0x10FFFF - ord(c)) for c in v) for v in name_key]
-                return (tier, name_key, x.filename)
+                return (tier, x.nkey_rev if sm == 1 else x.nkey, x.filename)
             items.sort(key=sort_key)
 
         move_cmds = []
@@ -578,7 +596,7 @@ class MPVQtManager(QMainWindow):
                         temp_m3u = tf.name
                     cmd_type = "append" if append else "replace"
                     self.send_command({"command": ["loadlist", temp_m3u, cmd_type]})
-                    QTimer.singleShot(2000, lambda: os.remove(temp_m3u) if os.path.exists(temp_m3u) else None)
+                    QTimer.singleShot(8000, lambda: os.remove(temp_m3u) if os.path.exists(temp_m3u) else None)
                 except:
                     if temp_m3u and os.path.exists(temp_m3u): os.remove(temp_m3u)
         else:
@@ -683,7 +701,6 @@ class MPVQtManager(QMainWindow):
                     json.dump({"x": self.x(), "y": self.y(), "w": self.width(), "h": self.height(), "current_group": self.current_group, "last_playing": cp, "favorites": list(self.favorites), "last_playlist_path": self.last_playlist_path, "sort_mode": self.sort_mode, "show_fab": self.show_fab_enabled, "show_logos": self.show_logos_enabled}, f)
         except: pass
 
-    def moveEvent(self, event): super().moveEvent(event); self.save_all_data()
     def closeEvent(self, event): self.save_all_data(); super().closeEvent(event)
 
 if __name__ == "__main__":

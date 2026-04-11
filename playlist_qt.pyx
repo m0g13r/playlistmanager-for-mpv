@@ -24,7 +24,7 @@ cdef class PlaylistItem:
 
 class UpdateSignals(QObject):
     finished = Signal(dict, list, str, bool)
-    logo_loaded = Signal(object, QPoint)  # QImage for real logos, str name for placeholder
+    logo_loaded = Signal(object, QPoint)  # QPixmap for logos, str name for placeholder fallback
     sockets_refreshed = Signal(list)
 
 class LogoPopup(QLabel):
@@ -79,21 +79,21 @@ class MPVQtManager(QMainWindow):
         self.is_probing_sockets = False
         self._save_timer = None
         self.load_all_data()
-        
+
         self.signals = UpdateSignals()
         self.signals.finished.connect(self._finalize_update)
         self.signals.sockets_refreshed.connect(self._apply_socket_refresh)
         self.signals.logo_loaded.connect(self._show_logo_popup)
-        
+
         self.apply_styles()
         self.ensure_mpv_running()
-        
+
         central = QWidget()
         self.setCentralWidget(central)
         self.vbox = QVBoxLayout(central)
         self.vbox.setSpacing(4)
         self.vbox.setContentsMargins(5, 5, 5, 5)
-        
+
         self.header = QHBoxLayout()
         self.header.setSpacing(4)
         self.search_entry = QLineEdit()
@@ -107,7 +107,7 @@ class MPVQtManager(QMainWindow):
         self.header.addWidget(self.group_btn)
         self.header.addWidget(self.burger_btn)
         self.vbox.addLayout(self.header)
-        
+
         self.tree_view = QListView()
         self.tree_view.setFrameShape(QFrame.NoFrame)
         self.tree_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -118,26 +118,26 @@ class MPVQtManager(QMainWindow):
         self.tree_view.setMouseTracking(True)
         self.tree_view.viewport().installEventFilter(self)
         self.vbox.addWidget(self.tree_view)
-        
+
         self.logo_label = LogoPopup()
-        
+
         self.fab_container = QWidget(self)
         self.fab_layout = QVBoxLayout(self.fab_container)
         self.fab_layout.setContentsMargins(0, 0, 0, 0)
         self.fab_layout.setSpacing(6)
-        
+
         self.sub_buttons = QWidget()
         self.sub_layout = QVBoxLayout(self.sub_buttons)
         self.sub_layout.setContentsMargins(0, 0, 0, 0)
         self.sub_layout.setSpacing(6)
-        
+
         self.vol_slider = QSlider(Qt.Vertical)
         self.vol_slider.setRange(0, 130)
         self.vol_slider.setFixedSize(32, 120)
         self.vol_slider.setObjectName("fab-vol")
         self.vol_slider.valueChanged.connect(self.on_vol_changed)
         self.sub_layout.addWidget(self.vol_slider)
-        
+
         for icon_name, cmd in [("media-playlist-shuffle-symbolic", ["playlist-shuffle"]), ("media-skip-forward-symbolic", ["playlist-next"]), ("media-playback-start-symbolic", ["cycle", "pause"]), ("media-skip-backward-symbolic", ["playlist-prev"])]:
             btn = QPushButton()
             btn.setIcon(QIcon.fromTheme(icon_name))
@@ -149,24 +149,24 @@ class MPVQtManager(QMainWindow):
                 btn.clicked.connect(lambda checked=False, c=cmd: self.send_command({"command": c}))
             btn.setFixedSize(32, 32)
             self.sub_layout.addWidget(btn)
-            
+
         self.sub_buttons.setVisible(False)
         self.main_fab = QPushButton()
         self.main_fab.setIcon(QIcon.fromTheme("view-more-horizontal-symbolic"))
         self.main_fab.setObjectName("fab-trigger")
         self.main_fab.setFixedSize(32, 32)
         self.main_fab.clicked.connect(self.toggle_fab)
-        
+
         self.fab_layout.addWidget(self.sub_buttons)
         self.fab_layout.addWidget(self.main_fab)
         self.fab_container.setVisible(self.show_fab_enabled)
-        
+
         self.group_btn.clicked.connect(self.show_group_menu)
         self.burger_btn.clicked.connect(self.show_burger_menu)
         self.tree_view.clicked.connect(self.on_row_activated)
         self.tree_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree_view.customContextMenuRequested.connect(self.on_right_click)
-        
+
         QTimer.singleShot(0, self.auto_load_last_m3u)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_now_playing)
@@ -201,13 +201,13 @@ class MPVQtManager(QMainWindow):
             QPushButton#fab-small:hover { background-color: rgba(80, 80, 80, 220); }
             QPushButton#fab-shuffle { border-radius: 16px; background-color: rgba(60, 60, 60, 160); qproperty-iconSize: 16px; color: #444444; }
             QPushButton#fab-shuffle:hover { background-color: rgba(80, 80, 80, 220); }
-            
+
             QSlider#fab-vol { background: rgba(60, 60, 60, 160); border-radius: 16px; padding: 10px 0px; }
             QSlider::groove:vertical#fab-vol { background: rgba(255, 255, 255, 40); width: 4px; border-radius: 2px; }
             QSlider::handle:vertical#fab-vol { background: #3584e4; height: 12px; width: 12px; margin: 0 -4px; border-radius: 6px; }
             QSlider::sub-page:vertical#fab-vol { background: rgba(255, 255, 255, 40); border-radius: 2px; }
             QSlider::add-page:vertical#fab-vol { background: #3584e4; border-radius: 2px; }
-            
+
             QListView { background-color: white; border: none; }
             QListView::item { padding: 6px 10px; border-radius: 8px; margin-bottom: 2px; }
             QListView::item:selected { background-color: #3584e4; color: white; }
@@ -261,28 +261,36 @@ class MPVQtManager(QMainWindow):
         return pix
 
     def _load_logo_async(self, url, pos, name):
+        # OPT: convert to QPixmap here (in the background thread) and cache it
+        # directly, so _show_logo_popup never has to do a QImage→QPixmap conversion
+        # on the main thread for a URL that has already been seen.
         try:
             if url.startswith("http"):
                 data = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=1).read()
                 img = QImage.fromData(data)
-            else: img = QImage(url)
+            else:
+                img = QImage(url)
             if not img.isNull():
+                pix = QPixmap.fromImage(img).scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 with self.logo_lock:
                     if len(self.logo_cache) > 200:
                         self.logo_cache = {k: v for k, v in self.logo_cache.items() if k.startswith("txt_")}
-                    self.logo_cache[url] = img
-                self.signals.logo_loaded.emit(img, pos)
-            else: self.signals.logo_loaded.emit(name, pos)
-        except: self.signals.logo_loaded.emit(name, pos)
+                    self.logo_cache[url] = pix
+                self.signals.logo_loaded.emit(pix, pos)
+            else:
+                self.signals.logo_loaded.emit(name, pos)
+        except:
+            self.signals.logo_loaded.emit(name, pos)
 
     def _show_logo_popup(self, img_or_name, pos):
         if not self.tree_view.underMouse() or not self.show_logos_enabled: return
         if isinstance(img_or_name, str):
+            # Fallback: no image loaded or URL failed — show text placeholder.
             pix = self._get_text_placeholder(img_or_name)
-        elif isinstance(img_or_name, QImage):
-            pix = QPixmap.fromImage(img_or_name).scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         else:
-            pix = img_or_name  # already QPixmap (from cache hit path)
+            # QPixmap: either from the cache, from _load_logo_async (now always
+            # converted to QPixmap before caching), or from _get_text_placeholder.
+            pix = img_or_name
         self.logo_label.setPixmap(pix)
         self.logo_label.move(pos.x() + 15, pos.y() + 15)
         if self.logo_label.isHidden(): self.logo_label.show()
@@ -462,7 +470,7 @@ class MPVQtManager(QMainWindow):
             items.sort(key=sort_key)
 
         n = len(items)
-        
+
         # move_cmds already [] from cdef declaration above
         for i in range(n):
             it = <PlaylistItem>items[i]
@@ -475,10 +483,10 @@ class MPVQtManager(QMainWindow):
                     elif ot.orig_idx > it.orig_idx and ot.orig_idx <= i:
                         ot.orig_idx -= 1
                 it.orig_idx = i
-        
+
         if move_cmds:
             self.send_commands_batch(move_cmds)
-        
+
         self.signals.finished.emit(gc, items, cp, ps)
 
     def _finalize_update(self, group_counts, full_sorted, curr_path, is_paused):
@@ -531,8 +539,19 @@ class MPVQtManager(QMainWindow):
         menu.addAction("Clear Playlist").triggered.connect(lambda chk=False: self.on_clear_clicked())
         menu.exec(self.burger_btn.mapToGlobal(QPoint(0, 28)))
 
-    def toggle_fab_v(self, chk): self.show_fab_enabled = chk; self.fab_container.setVisible(chk); self.save_all_data()
-    def toggle_logos_v(self, chk): self.show_logos_enabled = chk; self.logo_label.hide() if not chk else None; self.save_all_data()
+    def toggle_fab_v(self, chk):
+        self.show_fab_enabled = chk
+        self.fab_container.setVisible(chk)
+        # FIX: reposition the FAB container when it becomes visible — without this
+        # the container sits at (0, 0) if the window was resized while it was hidden.
+        if chk: self.update_fab_pos()
+        self.save_all_data()
+
+    def toggle_logos_v(self, chk):
+        self.show_logos_enabled = chk
+        if not chk: self.logo_label.hide()
+        self.save_all_data()
+
     def switch_socket(self, p): self.socket_path = p; self.update_playlist()
 
     def filter_playlist(self):
@@ -541,11 +560,14 @@ class MPVQtManager(QMainWindow):
         self.tree_view.setModel(None)
         self.list_model.clear(); q = self.search_entry.text().lower().strip(); si = None
         with self.lock: fc = set(self.favorites)
+        show_all = (self.current_group == "All")
+        show_favs = (self.current_group == "★ Favorites")
         for i in self.full_list:
             nm, grp, idx, fn = i.name, i.group, i.orig_idx, i.filename
             isf = nm in fc
-            if not isf and not ((self.current_group == "All") or (grp == self.current_group)): continue
-            if self.current_group == "★ Favorites" and not isf: continue
+            if not show_all:
+                if show_favs and not isf: continue
+                if not show_favs and not isf and grp != self.current_group: continue
             if q and q not in i.name_lower: continue
             isp = (fn == self.current_playing_filename)
             dnm = (f"{'⏸ ' if self.is_paused else '▶ '}" if isp else "") + (f"★ {nm}" if isf else nm)
@@ -584,7 +606,7 @@ class MPVQtManager(QMainWindow):
         if not path: return
         is_remote = path.startswith(('http://', 'https://', 'ftp://'))
         if not append: self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = {}, {}, {}, {}
-        
+
         if not is_remote and os.path.isdir(path):
             files = []
             exts = ('.mkv', '.mp4', '.webm', '.avi', '.mov', '.flv', '.wmv', '.ts', '.m2ts', '.mts', '.vob', '.ogv', '.qt', '.rmvb', '.asf', '.amv', '.m4v', '.mpg', '.mpeg', '.m2v', '.divx', '.3gp', '.3g2',
@@ -628,10 +650,10 @@ class MPVQtManager(QMainWindow):
                                     if logo: self.m3u_logos[cn] = logo.group(1)
                             elif line and not line.startswith("#"): self.url_to_group[line] = lg
                 except: pass
-            
+
             cmd = "loadlist" if path.lower().split('?')[0].endswith(pl_exts) else "loadfile"
             self.send_command({"command": [cmd, path, cmd_type]})
-            
+
         if not append: self.last_playlist_path = path
         self.save_all_data()
         self.send_command({"command": ["set_property", "pause", False]})

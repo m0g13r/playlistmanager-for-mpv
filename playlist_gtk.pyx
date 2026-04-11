@@ -34,30 +34,41 @@ class MPVGTKManager(Gtk.Window):
         self.is_probing_sockets = False
         self.available_sockets = []
         self._save_pending = False
-        
-        self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
+
         self._re_nonword = re.compile(r'\W+')
         self._re_digit = re.compile(r'(\d+)')
         self._re_m3u_group = re.compile(r'group-title="([^"]+)"')
         self._re_m3u_logo = re.compile(r'tvg-logo="([^"]+)"')
         self._re_m3u_name = re.compile(r',(.+)$')
+
+        # --- Logo popup window ---
+        # FIX: set_decorated(False) prevents a titlebar appearing on some WMs.
+        # set_skip_taskbar/pager_hint keeps it out of alt-tab and the pager.
+        self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
+        self.logo_popup.set_decorated(False)
+        self.logo_popup.set_skip_taskbar_hint(True)
+        self.logo_popup.set_skip_pager_hint(True)
         rgba_visual = self.get_screen().get_rgba_visual()
         if rgba_visual is not None:
             self.logo_popup.set_visual(rgba_visual)
         self.logo_popup.set_app_paintable(True)
+        # FIX: connect the draw signal so the compositor clears the window to
+        # fully transparent before the child Image widget paints the pixbuf.
+        # Without this the background is an opaque compositor default on many setups.
+        self.logo_popup.connect("draw", self._on_logo_popup_draw)
         self.logo_image = Gtk.Image()
         self.logo_popup.add(self.logo_image)
-        
+
         self.apply_css()
         self.ensure_mpv_running()
         self.set_default_size(200, 750)
         self.set_size_request(50, -1)
         self.load_all_data()
-        
+
         hb = Gtk.HeaderBar(show_close_button=True, decoration_layout="menu:close")
         hb.get_style_context().add_class("compact-header")
         self.set_titlebar(hb)
-        
+
         self.search_entry = Gtk.SearchEntry(placeholder_text="Search...", hexpand=True, width_chars=1)
         self.current_search_query = ""
         def on_search_changed(w):
@@ -65,24 +76,24 @@ class MPVGTKManager(Gtk.Window):
             self.filter.refilter()
         self.search_entry.connect("changed", on_search_changed)
         hb.set_custom_title(self.search_entry)
-        
+
         self.menu_button, self.group_button = Gtk.MenuButton(label="≡"), Gtk.MenuButton(label="▾")
         self.main_menu, self.group_menu = Gtk.Menu(), Gtk.Menu()
         self.socket_submenu = Gtk.Menu()
         self.socket_root_item = Gtk.MenuItem(label="Select Player")
         self.socket_root_item.set_submenu(self.socket_submenu)
-        
+
         self.rebuild_main_menu()
         self.menu_button.set_popup(self.main_menu)
         self.group_button.set_popup(self.group_menu)
         hb.pack_end(self.menu_button)
         hb.pack_end(self.group_button)
-        
+
         self.overlay = Gtk.Overlay()
         self.add(self.overlay)
         self.scrolled = Gtk.ScrolledWindow()
         self.overlay.add(self.scrolled)
-        
+
         # Columns: 0=display_name, 1=orig_idx, 2=weight, 3=group, 4=fg, 5=bg, 6=filename, 7=raw_name, 8=raw_name_lower
         self.list_store = Gtk.ListStore(str, int, int, str, str, str, str, str, str)
         self.filter_cached_favs = set()  # Opt #6: lock-free cache for filter_func
@@ -96,11 +107,11 @@ class MPVGTKManager(Gtk.Window):
         self.tree_view.connect("motion-notify-event", self.on_mouse_motion)
         self.tree_view.connect("leave-notify-event", lambda w, e: self.logo_popup.hide())
         self.connect("leave-notify-event", lambda w, e: self.logo_popup.hide())
-        
+
         r_txt = Gtk.CellRendererText(xpad=8, ypad=6, ellipsize=3)
         self.tree_view.append_column(Gtk.TreeViewColumn("Name", r_txt, text=0, weight=2, foreground=4, background=5))  # col 7 (raw_name) is invisible
         self.scrolled.add(self.tree_view)
-        
+
         self.fab_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.END, valign=Gtk.Align.END, margin_bottom=25, margin_right=25)
         self.revealer = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
         sub_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -110,7 +121,7 @@ class MPVGTKManager(Gtk.Window):
         self.vol_scale.get_style_context().add_class("fab-vol-slider")
         self.vol_scale.connect("value-changed", self.on_vol_changed)
         sub_box.pack_start(self.vol_scale, False, False, 0)
-        
+
         for icon, cmd in [("media-playlist-shuffle-symbolic", ["playlist-shuffle"]), ("media-skip-forward-symbolic", ["playlist-next"]), ("media-playback-start-symbolic", ["cycle", "pause"]), ("media-skip-backward-symbolic", ["playlist-prev"])]:
             btn = Gtk.Button.new_from_icon_name(icon, Gtk.IconSize.MENU)
             btn.get_style_context().add_class("fab-button")
@@ -127,7 +138,7 @@ class MPVGTKManager(Gtk.Window):
                 btn.get_style_context().add_class("fab-small")
                 btn.connect("clicked", lambda w, c=cmd: (self.send_command({"command": c}), self.revealer.set_reveal_child(False)))
             sub_box.pack_start(btn, False, False, 0)
-            
+
         self.revealer.add(sub_box)
         self.fab_container.pack_start(self.revealer, False, False, 0)
         self.main_fab = Gtk.Button.new_from_icon_name("view-more-horizontal-symbolic", Gtk.IconSize.MENU)
@@ -136,13 +147,13 @@ class MPVGTKManager(Gtk.Window):
         self.fab_container.pack_start(self.main_fab, False, False, 0)
         self.overlay.add_overlay(self.fab_container)
         self.fab_container.set_visible(self.show_fab_enabled)
-        
+
         self.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY)
         self.drag_dest_add_uri_targets()
         self.connect("drag-data-received", self.on_drag_data_received)
         self.connect("delete-event", self.on_delete_event)
         self.connect("configure-event", self.on_configure_event)
-        
+
         self.show_all()
         GLib.idle_add(self.auto_load_last_m3u)
         GLib.timeout_add(1000, self.update_now_playing)
@@ -151,6 +162,15 @@ class MPVGTKManager(Gtk.Window):
     def _normalize(self, s): return self._re_nonword.sub('', s).lower() if s else ""
 
     def _get_nkey(self, s): return [int(t) if t.isdigit() else t.lower() for t in self._re_digit.split(s)]
+
+    def _on_logo_popup_draw(self, widget, ctx):
+        # FIX: clear the window to fully transparent before child widgets paint.
+        # Required for RGBA composited windows; without this the background is
+        # whatever the compositor defaults to (typically opaque grey/white).
+        ctx.set_operator(cairo.OPERATOR_SOURCE)
+        ctx.set_source_rgba(0, 0, 0, 0)
+        ctx.paint()
+        return False  # let child widgets draw on top
 
     def apply_css(self):
         css = b".compact-header { min-height: 24px; padding: 0; } .compact-header button { padding: 1px 2px; min-height: 20px; min-width: 20px; } .compact-header entry { min-height: 20px; margin: 2px 0; } .fab-button { border-radius: 50%; border: none; padding: 0; transition: all 150ms ease; box-shadow: none; } .fab-trigger { min-width: 32px; min-height: 32px; background: rgba(53, 132, 228, 0.7); color: white; } .fab-trigger:hover { background: rgba(53, 132, 228, 0.9); } .fab-small { min-width: 28px; min-height: 28px; background: rgba(60, 60, 60, 0.6); color: white; } .fab-small:hover { background: rgba(80, 80, 80, 0.8); } .fab-shuffle { min-width: 28px; min-height: 28px; background: rgba(60, 60, 60, 0.6); color: #444444; } .fab-shuffle:hover { background: rgba(80, 80, 80, 0.8); } .fab-vol-slider { background: rgba(60, 60, 60, 0.6); border-radius: 14px; padding: 12px 0; } scale.fab-vol-slider contents trough { background: rgba(255, 255, 255, 0.2); min-width: 4px; border-radius: 2px; margin: 0 12px; } scale.fab-vol-slider contents trough highlight { background: #3584e4; border-radius: 2px; } scale.fab-vol-slider contents trough slider { background: #3584e4; min-width: 12px; min-height: 12px; border-radius: 50%; margin: -4px; border: none; box-shadow: none; } treeview { background-color: transparent; } treeview selection { border-radius: 8px; } treeview:selected { border-radius: 8px; background-color: #3584e4; color: white; }"
@@ -343,7 +363,7 @@ class MPVGTKManager(Gtk.Window):
             items.sort(key=sort_key)
 
         n = len(items)
-        
+
         # Optimized move simulation (move_cmds already [] from cdef above)
         for i in range(n):
             it = <PlaylistItem>items[i]
@@ -357,10 +377,10 @@ class MPVGTKManager(Gtk.Window):
                     elif ot.orig_idx > it.orig_idx and ot.orig_idx <= i:
                         ot.orig_idx -= 1
                 it.orig_idx = i
-        
+
         if move_cmds:
             self.send_commands_batch(move_cmds)
-        
+
         GLib.idle_add(self._finalize_update, group_counts, items, curr_p, paused)
 
     def _set_updating_false(self):
@@ -380,15 +400,18 @@ class MPVGTKManager(Gtk.Window):
             is_f = (item_obj.name in fav_copy)
             status_icon = "⏸ " if (is_p and paused) else ("▶ " if is_p else "")
             dn = status_icon + ("★ " if is_f else "") + item_obj.name
-            bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, "#555555", 400)
+            # FIX: use None for fg/bg on non-playing items instead of hardcoded "#555555".
+            # None tells GTK to use the theme's default text/background colour, which
+            # works correctly on both light and dark themes.
+            bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, None, 400)
             self.list_store.append([dn, item_obj.orig_idx, w, item_obj.group, fg, bg, item_obj.filename, item_obj.name, item_obj.name.lower()])
             if is_p:
                 active_store_path = len(self.list_store) - 1  # store row index
-            
+
         self.rebuild_group_menu(group_counts)
         self.tree_view.set_model(self.filter)
         self.filter.refilter()
-        
+
         if active_store_path is not None:
             store_iter = self.list_store.iter_nth_child(None, active_store_path)
             if store_iter:
@@ -397,7 +420,7 @@ class MPVGTKManager(Gtk.Window):
                 if filter_path:
                     self.tree_view.get_selection().select_path(filter_path)
                     self.tree_view.scroll_to_cell(filter_path, None, True, 0.5, 0.5)
-            
+
         if not self.resume_done and self.last_file_path:
             for item_obj in full_sorted:
                 if item_obj.filename == self.last_file_path:
@@ -405,14 +428,14 @@ class MPVGTKManager(Gtk.Window):
                     self.send_command({"command": ["set_property", "pause", True]})
                     self.resume_done = True
                     break
-                    
+
         with self.update_lock: self.is_updating = False
         return False
 
     def rebuild_group_menu(self, group_counts):
         for c in self.group_menu.get_children(): self.group_menu.remove(c)
         with self.favorites_lock: fav_copy = set(self.favorites)
-        
+
         f_count = sum(1 for x in self.full_list_data if x.name in fav_copy)
         for gn, c in [("All", len(self.full_list_data)), ("★ Favorites", f_count)]:
             lbl = f"{gn} ({c})"
@@ -420,7 +443,7 @@ class MPVGTKManager(Gtk.Window):
             item.connect("activate", self.on_group_selected, gn)
             self.group_menu.append(item)
         self.group_menu.append(Gtk.SeparatorMenuItem())
-        
+
         for g in sorted(group_counts.keys()):
             lbl = f"{g} ({group_counts[g]})"
             item = Gtk.MenuItem(label=f"• {lbl}" if g == self.current_group else lbl)
@@ -452,6 +475,8 @@ class MPVGTKManager(Gtk.Window):
         # Opt #6: use pre-snapshot favorites, no lock required here
         cg = self.current_group
         sq = self.current_search_query
+        # OPT: fast path for the most common case — show-all with no search query.
+        if cg == "All" and not sq: return True
         fc = self.filter_cached_favs
         name = model.get_value(tree_iter, 7)
         grp = model.get_value(tree_iter, 3)
@@ -551,7 +576,7 @@ class MPVGTKManager(Gtk.Window):
             current_size -= 1
         ctx.set_source_rgb(0.9, 0.9, 0.9)
         w, h = layout.get_pixel_size()
-        ctx.move_to(8, (60-h)/2)
+        ctx.move_to(8, (60 - h) / 2)
         PangoCairo.show_layout(ctx, layout)
         pb = Gdk.pixbuf_get_from_surface(surface, 0, 0, 60, 60)
         self.logo_cache[cache_key] = pb
@@ -562,11 +587,19 @@ class MPVGTKManager(Gtk.Window):
             if url.startswith("http"):
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 data = urllib.request.urlopen(req, timeout=1).read()
+                # FIX: always close the loader, even if write() raises, to avoid
+                # leaking the internal GdkPixbuf pipeline state.
                 loader = GdkPixbuf.PixbufLoader()
-                loader.write(data)
-                loader.close()
-                pb = loader.get_pixbuf()
-            else: pb = GdkPixbuf.Pixbuf.new_from_file(url)
+                try:
+                    loader.write(data)
+                    loader.close()
+                    pb = loader.get_pixbuf()
+                except:
+                    try: loader.close()
+                    except: pass
+                    pb = None
+            else:
+                pb = GdkPixbuf.Pixbuf.new_from_file(url)
             if pb:
                 orig_w, orig_h = pb.get_width(), pb.get_height()
                 scale = min(50 / orig_w, 50 / orig_h)
@@ -585,8 +618,10 @@ class MPVGTKManager(Gtk.Window):
                         self.logo_cache = {k: v for k, v in self.logo_cache.items() if k.startswith("txt_")}
                     self.logo_cache[url] = round_pb
                 GLib.idle_add(self._show_logo, round_pb, x, y)
-            else: GLib.idle_add(lambda: self._show_logo(self._get_text_placeholder(name), x, y))
-        except: GLib.idle_add(lambda: self._show_logo(self._get_text_placeholder(name), x, y))
+            else:
+                GLib.idle_add(lambda: self._show_logo(self._get_text_placeholder(name), x, y))
+        except:
+            GLib.idle_add(lambda: self._show_logo(self._get_text_placeholder(name), x, y))
 
     def _show_logo(self, pb, x, y):
         if not self.show_logos_enabled: return
@@ -598,7 +633,7 @@ class MPVGTKManager(Gtk.Window):
         if not path: return
         is_remote = path.startswith(('http://', 'https://', 'ftp://'))
         if not append: self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = {}, {}, {}, {}
-        
+
         if not is_remote and os.path.isdir(path):
             files = []
             exts = ('.mkv', '.mp4', '.webm', '.avi', '.mov', '.flv', '.wmv', '.ts', '.m2ts', '.mts', '.vob', '.ogv', '.qt', '.rmvb', '.asf', '.amv', '.m4v', '.mpg', '.mpeg', '.m2v', '.divx', '.3gp', '.3g2',
@@ -616,7 +651,13 @@ class MPVGTKManager(Gtk.Window):
                         temp_m3u = tf.name
                     cmd_type = "append" if append else "replace"
                     self.send_command({"command": ["loadlist", temp_m3u, cmd_type]})
-                    GLib.timeout_add(8000, lambda: (os.remove(temp_m3u) if os.path.exists(temp_m3u) else None, False)[1])
+                    # FIX: use a proper closure instead of the tuple-index lambda hack
+                    # `(os.remove(...), False)[1]`. A named default arg captures temp_m3u
+                    # correctly even if the outer scope changes before the timeout fires.
+                    def _cleanup(p=temp_m3u):
+                        if os.path.exists(p): os.remove(p)
+                        return False
+                    GLib.timeout_add(8000, _cleanup)
                 except:
                     if temp_m3u and os.path.exists(temp_m3u): os.remove(temp_m3u)
         else:
@@ -642,10 +683,10 @@ class MPVGTKManager(Gtk.Window):
                                     if logo: self.m3u_logos[cn] = logo.group(1)
                             elif line and not line.startswith("#"): self.url_to_group[line] = lg
                 except: pass
-            
+
             cmd = "loadlist" if path.lower().split('?')[0].endswith(pl_exts) else "loadfile"
             self.send_command({"command": [cmd, path, cmd_type]})
-            
+
         if not append: self.last_playlist_path = path
         self.save_all_data()
         self.send_command({"command": ["set_property", "pause", False]})

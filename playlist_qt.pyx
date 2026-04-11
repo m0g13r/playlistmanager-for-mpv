@@ -1,5 +1,4 @@
-import sys, socket, json, os, subprocess, re, threading, glob, urllib.request, tempfile, time
-from pathlib import Path
+import sys, socket, json, os, subprocess, re, threading, glob, urllib.request, tempfile
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel, QEvent, QRect
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QIcon, QPixmap, QImage, QPainter, QFontMetrics, QBrush
@@ -68,6 +67,9 @@ class MPVQtManager(QMainWindow):
         self.config_file = os.path.expanduser("~/.mpv_qt_config.json")
         self._re_nonword = re.compile(r'\W+')
         self._re_digit = re.compile(r'(\d+)')
+        self._re_m3u_group = re.compile(r'group-title="([^"]+)"')
+        self._re_m3u_logo = re.compile(r'tvg-logo="([^"]+)"')
+        self._re_m3u_name = re.compile(r',(.+)$')
         self.favorites, self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = set(), {}, {}, {}, {}
         self.sort_mode, self.current_playing_filename, self.is_paused, self.current_group = 0, "", False, "All"
         self.full_list, self.group_counts, self.is_updating, self.resume_done, self.last_file, self.last_playlist_path = [], {}, False, False, "", ""
@@ -75,6 +77,7 @@ class MPVQtManager(QMainWindow):
         self.update_lock = threading.Lock()  # Opt #6: guard is_updating
         self.logo_lock = threading.Lock()  # guard logo_cache cross-thread access
         self.is_probing_sockets = False
+        self._save_timer = None
         self.load_all_data()
         
         self.signals = UpdateSignals()
@@ -264,7 +267,10 @@ class MPVQtManager(QMainWindow):
                 img = QImage.fromData(data)
             else: img = QImage(url)
             if not img.isNull():
-                with self.logo_lock: self.logo_cache[url] = img
+                with self.logo_lock:
+                    if len(self.logo_cache) > 200:
+                        self.logo_cache = {k: v for k, v in self.logo_cache.items() if k.startswith("txt_")}
+                    self.logo_cache[url] = img
                 self.signals.logo_loaded.emit(img, pos)
             else: self.signals.logo_loaded.emit(name, pos)
         except: self.signals.logo_loaded.emit(name, pos)
@@ -301,7 +307,7 @@ class MPVQtManager(QMainWindow):
         self._schedule_save()
 
     def _schedule_save(self):
-        if not getattr(self, '_save_timer', None):
+        if self._save_timer is None:
             self._save_timer = QTimer()
             self._save_timer.setSingleShot(True)
             self._save_timer.timeout.connect(self._do_save)
@@ -455,9 +461,9 @@ class MPVQtManager(QMainWindow):
                 return (tier, x.nkey_rev if sm == 1 else x.nkey, x.filename)
             items.sort(key=sort_key)
 
-        move_cmds = []
         n = len(items)
         
+        # move_cmds already [] from cdef declaration above
         for i in range(n):
             it = <PlaylistItem>items[i]
             if it.orig_idx != i:
@@ -512,7 +518,7 @@ class MPVQtManager(QMainWindow):
         sort_labels = {0: "Sort: A-Z", 1: "Sort: Z-A"}
         current_sort_label = sort_labels.get(self.sort_mode, "Sort: A-Z")
         for l, cb in [("Open Playlist", self.on_load_clicked), (current_sort_label, self.toggle_sort), ("Refresh", self.update_playlist)]:
-            menu.addAction(l).triggered.connect(cb)
+            menu.addAction(l).triggered.connect(lambda chk=False, f=cb: f())
         menu.addSeparator()
         for l, state, cb in [("Show FAB", self.show_fab_enabled, self.toggle_fab_v), ("Show Logos on Hover", self.show_logos_enabled, self.toggle_logos_v)]:
             mi = menu.addAction(l)
@@ -522,7 +528,7 @@ class MPVQtManager(QMainWindow):
         for p, l in self.available_sockets:
             sm.addAction(f"✔ {l}" if p == self.socket_path else l).triggered.connect(lambda chk=False, path=p: self.switch_socket(path))
         menu.addSeparator()
-        menu.addAction("Clear Playlist").triggered.connect(self.on_clear_clicked)
+        menu.addAction("Clear Playlist").triggered.connect(lambda chk=False: self.on_clear_clicked())
         menu.exec(self.burger_btn.mapToGlobal(QPoint(0, 28)))
 
     def toggle_fab_v(self, chk): self.show_fab_enabled = chk; self.fab_container.setVisible(chk); self.save_all_data()
@@ -604,9 +610,9 @@ class MPVQtManager(QMainWindow):
             cmd_type = "append" if append else "replace"
             if not is_remote and os.path.exists(path) and path.lower().split('?')[0].endswith(pl_exts):
                 try:
-                    re_group = re.compile(r'group-title="([^"]+)"')
-                    re_logo = re.compile(r'tvg-logo="([^"]+)"')
-                    re_name = re.compile(r',(.+)$')
+                    re_group = self._re_m3u_group
+                    re_logo = self._re_m3u_logo
+                    re_name = self._re_m3u_name
                     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                         lg = "Uncategorized"
                         for line in f:

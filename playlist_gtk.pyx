@@ -1,7 +1,6 @@
-import sys, socket, json, os, subprocess, re, gi, threading, glob, urllib.request, tempfile, time
-from pathlib import Path
+import sys, socket, json, os, subprocess, re, gi, threading, glob, urllib.request, tempfile
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GObject, GLib, Gdk, GdkPixbuf, Pango, PangoCairo
+from gi.repository import Gtk, GLib, Gdk, GdkPixbuf, Pango, PangoCairo
 import cairo, math
 os.environ["QT_ACCESSIBILITY"] = "0"
 
@@ -34,10 +33,14 @@ class MPVGTKManager(Gtk.Window):
         self.show_logos_enabled = True
         self.is_probing_sockets = False
         self.available_sockets = []
+        self._save_pending = False
         
         self.logo_popup = Gtk.Window(type=Gtk.WindowType.POPUP)
         self._re_nonword = re.compile(r'\W+')
         self._re_digit = re.compile(r'(\d+)')
+        self._re_m3u_group = re.compile(r'group-title="([^"]+)"')
+        self._re_m3u_logo = re.compile(r'tvg-logo="([^"]+)"')
+        self._re_m3u_name = re.compile(r',(.+)$')
         rgba_visual = self.get_screen().get_rgba_visual()
         if rgba_visual is not None:
             self.logo_popup.set_visual(rgba_visual)
@@ -117,6 +120,7 @@ class MPVGTKManager(Gtk.Window):
                     self.sort_mode = 2
                     self.send_command({"command": ["playlist-shuffle"]})
                     self.revealer.set_reveal_child(False)
+                    self.save_all_data()
                     self.update_playlist()
                 btn.connect("clicked", on_shuf)
             else:
@@ -155,7 +159,7 @@ class MPVGTKManager(Gtk.Window):
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
     def ensure_mpv_running(self):
-        if not os.path.exists(self.socket_path): subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not os.path.exists(self.socket_path): subprocess.Popen(["mpv", "--idle", f"--input-ipc-server={self.socket_path}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
     def rebuild_main_menu(self):
         for c in self.main_menu.get_children(): self.main_menu.remove(c)
@@ -338,10 +342,9 @@ class MPVGTKManager(Gtk.Window):
                 return (tier, x.nkey_rev if sm == 1 else x.nkey, x.filename)
             items.sort(key=sort_key)
 
-        move_cmds = []
         n = len(items)
         
-        # Optimized move simulation
+        # Optimized move simulation (move_cmds already [] from cdef above)
         for i in range(n):
             it = <PlaylistItem>items[i]
             if it.orig_idx != i:
@@ -444,19 +447,19 @@ class MPVGTKManager(Gtk.Window):
         self.set_title(str(title_res.get('data')) if (title_res and "data" in title_res) else "MPV")
         return True
 
-    def filter_func(self, model, iter, data):
+    def filter_func(self, model, tree_iter, data):
         # Opt #3: col 7 is the raw name (no prefix symbols)
         # Opt #6: use pre-snapshot favorites, no lock required here
         cg = self.current_group
         sq = self.current_search_query
         fc = self.filter_cached_favs
-        name = model.get_value(iter, 7)
-        grp = model.get_value(iter, 3)
+        name = model.get_value(tree_iter, 7)
+        grp = model.get_value(tree_iter, 3)
         is_fav = name in fc
         if not is_fav and not (cg == "All" or grp == cg): return False
         if cg == "★ Favorites" and not is_fav: return False
         if not sq: return True
-        name_lower = model.get_value(iter, 8)
+        name_lower = model.get_value(tree_iter, 8)
         return sq in name_lower
 
     def toggle_sort(self, mi):
@@ -577,7 +580,10 @@ class MPVGTKManager(Gtk.Window):
                 Gdk.cairo_set_source_pixbuf(ctx, pb, (60 - nw) / 2, (60 - nh) / 2)
                 ctx.paint()
                 round_pb = Gdk.pixbuf_get_from_surface(surface, 0, 0, 60, 60)
-                with self.logo_lock: self.logo_cache[url] = round_pb
+                with self.logo_lock:
+                    if len(self.logo_cache) > 200:
+                        self.logo_cache = {k: v for k, v in self.logo_cache.items() if k.startswith("txt_")}
+                    self.logo_cache[url] = round_pb
                 GLib.idle_add(self._show_logo, round_pb, x, y)
             else: GLib.idle_add(lambda: self._show_logo(self._get_text_placeholder(name), x, y))
         except: GLib.idle_add(lambda: self._show_logo(self._get_text_placeholder(name), x, y))
@@ -618,9 +624,9 @@ class MPVGTKManager(Gtk.Window):
             cmd_type = "append" if append else "replace"
             if not is_remote and os.path.exists(path) and path.lower().split('?')[0].endswith(pl_exts):
                 try:
-                    re_group = re.compile(r'group-title="([^"]+)"')
-                    re_logo = re.compile(r'tvg-logo="([^"]+)"')
-                    re_name = re.compile(r',(.+)$')
+                    re_group = self._re_m3u_group
+                    re_logo = self._re_m3u_logo
+                    re_name = self._re_m3u_name
                     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                         lg = "Uncategorized"
                         for line in f:
@@ -671,7 +677,7 @@ class MPVGTKManager(Gtk.Window):
         except: pass
 
     def on_configure_event(self, w, e):
-        if not getattr(self, '_save_pending', False):
+        if not self._save_pending:
             self._save_pending = True
             GLib.timeout_add(500, self._do_save)
         return False

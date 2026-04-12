@@ -339,70 +339,74 @@ class MPVGTKManager(Gtk.Window):
         cdef PlaylistItem it
         cdef int* c_orig_idx = NULL
 
-        results = self.send_commands_batch_read([
-            {"command": ["get_property", "playlist"]},
-            {"command": ["get_property", "path"]},
-            {"command": ["get_property", "pause"]}
-        ])
-        res = results[0] if results and len(results) > 0 else None
-        path_res = results[1] if results and len(results) > 1 else None
-        pause_res = results[2] if results and len(results) > 2 else None
-        curr_p = path_res.get("data", "") if path_res else ""
-        paused = pause_res.get("data", False) if pause_res else False
-        if not res or "data" not in res:
+        try:
+            results = self.send_commands_batch_read([
+                {"command": ["get_property", "playlist"]},
+                {"command": ["get_property", "path"]},
+                {"command": ["get_property", "pause"]}
+            ])
+            res = results[0] if results and len(results) > 0 else None
+            path_res = results[1] if results and len(results) > 1 else None
+            pause_res = results[2] if results and len(results) > 2 else None
+            curr_p = path_res.get("data", "") if path_res else ""
+            paused = pause_res.get("data", False) if pause_res else False
+            if not res or "data" not in res:
+                GLib.idle_add(self._set_updating_false)
+                return
+
+            with self.favorites_lock: fav_copy = set(self.favorites)
+
+            for idx, entry in enumerate(res["data"]):
+                fn = entry.get("filename", "")
+                name = (entry.get("title") or os.path.basename(fn)).strip()
+                grp = self.url_to_group.get(fn) or self.m3u_groups.get(self._normalize(name)) or "Uncategorized"
+                group_counts[grp] = group_counts.get(grp, 0) + 1
+                items.append(PlaylistItem(name, fn, idx, grp, self._get_nkey(name)))
+
+            sm = self.sort_mode
+            cur_grp = self.current_group
+
+            if sm != 2:
+                def sort_key(x):
+                    tier = -((2 if x.name in fav_copy else 0) +
+                             (1 if (cur_grp == "All" or
+                                   (cur_grp == "★ Favorites" and x.name in fav_copy) or
+                                   x.group == cur_grp) else 0))
+                    return (tier, x.nkey_rev if sm == 1 else x.nkey, x.filename)
+                items.sort(key=sort_key)
+
+            n = len(items)
+
+            if n > 0:
+                c_orig_idx = <int*>malloc(n * sizeof(int))
+                if c_orig_idx != NULL:
+                    try:
+                        for i in range(n):
+                            it = <PlaylistItem>items[i]
+                            c_orig_idx[i] = it.orig_idx
+
+                        for i in range(n):
+                            if c_orig_idx[i] != i:
+                                move_cmds.append({"command": ["playlist-move", c_orig_idx[i], i]})
+                                for j in range(n):
+                                    if c_orig_idx[j] < c_orig_idx[i] and c_orig_idx[j] >= i:
+                                        c_orig_idx[j] += 1
+                                    elif c_orig_idx[j] > c_orig_idx[i] and c_orig_idx[j] <= i:
+                                        c_orig_idx[j] -= 1
+                                c_orig_idx[i] = i
+
+                        for i in range(n):
+                            it = <PlaylistItem>items[i]
+                            it.orig_idx = c_orig_idx[i]
+                    finally:
+                        free(c_orig_idx)
+
+            if move_cmds:
+                self.send_commands_batch(move_cmds)
+
+            GLib.idle_add(self._finalize_update, group_counts, items, curr_p, paused)
+        except Exception:
             GLib.idle_add(self._set_updating_false)
-            return
-
-        with self.favorites_lock: fav_copy = set(self.favorites)
-
-        for idx, entry in enumerate(res["data"]):
-            fn = entry.get("filename", "")
-            name = (entry.get("title") or os.path.basename(fn)).strip()
-            grp = self.url_to_group.get(fn) or self.m3u_groups.get(self._normalize(name)) or "Uncategorized"
-            group_counts[grp] = group_counts.get(grp, 0) + 1
-            items.append(PlaylistItem(name, fn, idx, grp, self._get_nkey(name)))
-
-        sm = self.sort_mode
-        cur_grp = self.current_group
-
-        if sm != 2:
-            def sort_key(x):
-                tier = -((2 if x.name in fav_copy else 0) +
-                         (1 if (cur_grp == "All" or
-                               (cur_grp == "★ Favorites" and x.name in fav_copy) or
-                               x.group == cur_grp) else 0))
-                return (tier, x.nkey_rev if sm == 1 else x.nkey, x.filename)
-            items.sort(key=sort_key)
-
-        n = len(items)
-
-        if n > 0:
-            c_orig_idx = <int*>malloc(n * sizeof(int))
-            if c_orig_idx != NULL:
-                for i in range(n):
-                    it = <PlaylistItem>items[i]
-                    c_orig_idx[i] = it.orig_idx
-
-                for i in range(n):
-                    if c_orig_idx[i] != i:
-                        move_cmds.append({"command": ["playlist-move", c_orig_idx[i], i]})
-                        for j in range(n):
-                            if c_orig_idx[j] < c_orig_idx[i] and c_orig_idx[j] >= i:
-                                c_orig_idx[j] += 1
-                            elif c_orig_idx[j] > c_orig_idx[i] and c_orig_idx[j] <= i:
-                                c_orig_idx[j] -= 1
-                        c_orig_idx[i] = i
-
-                for i in range(n):
-                    it = <PlaylistItem>items[i]
-                    it.orig_idx = c_orig_idx[i]
-
-                free(c_orig_idx)
-
-        if move_cmds:
-            self.send_commands_batch(move_cmds)
-
-        GLib.idle_add(self._finalize_update, group_counts, items, curr_p, paused)
 
     def _set_updating_false(self):
         with self.update_lock: self.is_updating = False

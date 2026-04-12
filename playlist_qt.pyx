@@ -1,4 +1,5 @@
-import sys, socket, json, os, subprocess, re, threading, glob, urllib.request, tempfile
+import sys, socket, json, os, subprocess, re, threading, glob, urllib.request, tempfile, select
+from libc.stdlib cimport malloc, free
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QListView, QPushButton, QFileDialog, QAbstractItemView, QFrame, QMenu, QSlider, QLabel, QToolTip)
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QPoint, QItemSelectionModel, QEvent, QRect
 from PySide6.QtGui import QStandardItemModel, QStandardItem, QColor, QFont, QIcon, QPixmap, QImage, QPainter, QFontMetrics, QBrush
@@ -359,20 +360,25 @@ class MPVQtManager(QMainWindow):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(timeout); c.connect(path or self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
+                c.setblocking(False)
                 res = b""
                 while True:
-                    chunk = c.recv(16384)
-                    if not chunk: break
-                    res += chunk
-                    lines = res.split(b"\n")
-                    if len(lines) > 1:
-                        for line in lines[:-1]:
-                            if not line.strip(): continue
-                            try:
-                                data = json.loads(line.decode(errors="ignore"))
-                                if any(k in data for k in ["request_id", "error", "data"]): return data
-                            except: continue
-                        res = lines[-1]
+                    r, _, _ = select.select([c], [], [], timeout)
+                    if r:
+                        chunk = c.recv(16384)
+                        if not chunk: break
+                        res += chunk
+                        lines = res.split(b"\n")
+                        if len(lines) > 1:
+                            for line in lines[:-1]:
+                                if not line.strip(): continue
+                                try:
+                                    data = json.loads(line.decode(errors="ignore"))
+                                    if any(k in data for k in ["request_id", "error", "data"]): return data
+                                except: continue
+                            res = lines[-1]
+                    else:
+                        break
         except: pass
         return None
 
@@ -398,23 +404,28 @@ class MPVQtManager(QMainWindow):
                     payload = dict(cmd)
                     payload["request_id"] = i
                     c.sendall(json.dumps(payload).encode() + b"\n")
+                c.setblocking(False)
                 buf = b""
                 received = 0
                 while received < len(cmds):
-                    chunk = c.recv(16384)
-                    if not chunk: break
-                    buf += chunk
-                    lines = buf.split(b"\n")
-                    for line in lines[:-1]:
-                        if not line.strip(): continue
-                        try:
-                            data = json.loads(line.decode(errors="ignore"))
-                            rid = data.get("request_id")
-                            if rid is not None and 0 <= rid < len(cmds):
-                                results[rid] = data
-                                received += 1
-                        except: continue
-                    buf = lines[-1]
+                    r, _, _ = select.select([c], [], [], 1.0)
+                    if r:
+                        chunk = c.recv(16384)
+                        if not chunk: break
+                        buf += chunk
+                        lines = buf.split(b"\n")
+                        for line in lines[:-1]:
+                            if not line.strip(): continue
+                            try:
+                                data = json.loads(line.decode(errors="ignore"))
+                                rid = data.get("request_id")
+                                if rid is not None and 0 <= rid < len(cmds):
+                                    results[rid] = data
+                                    received += 1
+                            except: continue
+                        buf = lines[-1]
+                    else:
+                        break
         except: pass
         return results
 
@@ -433,7 +444,8 @@ class MPVQtManager(QMainWindow):
         cdef list items = []
         cdef list move_cmds = []
         cdef dict gc = {}
-        cdef PlaylistItem it, ot
+        cdef PlaylistItem it
+        cdef int* c_orig_idx = NULL
 
         results = self.send_commands_batch_read([
             {"command": ["get_property", "playlist"]},
@@ -471,18 +483,28 @@ class MPVQtManager(QMainWindow):
 
         n = len(items)
 
-        # move_cmds already [] from cdef declaration above
-        for i in range(n):
-            it = <PlaylistItem>items[i]
-            if it.orig_idx != i:
-                move_cmds.append({"command": ["playlist-move", it.orig_idx, i]})
-                for j in range(n):
-                    ot = <PlaylistItem>items[j]
-                    if ot.orig_idx < it.orig_idx and ot.orig_idx >= i:
-                        ot.orig_idx += 1
-                    elif ot.orig_idx > it.orig_idx and ot.orig_idx <= i:
-                        ot.orig_idx -= 1
-                it.orig_idx = i
+        if n > 0:
+            c_orig_idx = <int*>malloc(n * sizeof(int))
+            if c_orig_idx != NULL:
+                for i in range(n):
+                    it = <PlaylistItem>items[i]
+                    c_orig_idx[i] = it.orig_idx
+
+                for i in range(n):
+                    if c_orig_idx[i] != i:
+                        move_cmds.append({"command": ["playlist-move", c_orig_idx[i], i]})
+                        for j in range(n):
+                            if c_orig_idx[j] < c_orig_idx[i] and c_orig_idx[j] >= i:
+                                c_orig_idx[j] += 1
+                            elif c_orig_idx[j] > c_orig_idx[i] and c_orig_idx[j] <= i:
+                                c_orig_idx[j] -= 1
+                        c_orig_idx[i] = i
+
+                for i in range(n):
+                    it = <PlaylistItem>items[i]
+                    it.orig_idx = c_orig_idx[i]
+
+                free(c_orig_idx)
 
         if move_cmds:
             self.send_commands_batch(move_cmds)

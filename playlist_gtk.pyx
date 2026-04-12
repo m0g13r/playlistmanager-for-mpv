@@ -252,7 +252,9 @@ class MPVGTKManager(Gtk.Window):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(0.5)
                 c.connect(path or self.socket_path)
-                c.sendall(json.dumps(cmd).encode() + b"\n")
+                payload = dict(cmd)
+                payload["request_id"] = 999
+                c.sendall(json.dumps(payload).encode() + b"\n")
                 c.setblocking(False)
                 res = b""
                 while True:
@@ -267,7 +269,7 @@ class MPVGTKManager(Gtk.Window):
                                 if not line.strip(): continue
                                 try:
                                     data = json.loads(line.decode(errors="ignore"))
-                                    if any(k in data for k in ["request_id", "error", "data"]): return data
+                                    if data.get("request_id") == 999: return data
                                 except: continue
                             res = lines[-1]
                     else:
@@ -276,13 +278,20 @@ class MPVGTKManager(Gtk.Window):
         return None
 
     def send_commands_batch(self, cmds):
-        """Send multiple commands; returns None (fire-and-forget for playlist moves)."""
+        """Send multiple commands; flush read buffer to prevent MPV stalling."""
+        if not cmds: return None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(1.0)
                 c.connect(self.socket_path)
                 for cmd in cmds:
                     c.sendall(json.dumps(cmd).encode() + b"\n")
+                c.setblocking(False)
+                while True:
+                    r, _, _ = select.select([c], [], [], 0.2)
+                    if r:
+                        if not c.recv(16384): break
+                    else: break
         except: pass
         return None
 
@@ -330,9 +339,10 @@ class MPVGTKManager(Gtk.Window):
 
     def _update_thread(self):
         # All cdef declarations must appear before any executable statements in Cython.
-        cdef int i, j, n
+        cdef int i, j, n, idx
+        cdef bint paused
         cdef int sm
-        cdef str cur_grp
+        cdef str cur_grp, curr_p, fn, name, grp
         cdef dict group_counts = {}
         cdef list items = []
         cdef list move_cmds = []
@@ -482,18 +492,56 @@ class MPVGTKManager(Gtk.Window):
         self.update_playlist()
 
     def update_now_playing(self):
-        # Opt #2: fetch path, pause, media-title in ONE socket connection
         results = self.send_commands_batch_read([
             {"command": ["get_property", "path"]},
             {"command": ["get_property", "pause"]},
             {"command": ["get_property", "media-title"]},
+            {"command": ["get_property", "playlist-count"]}
         ])
-        path_res, pause_res, title_res = results
+        if not results: return True
+        path_res = results[0]
+        pause_res = results[1]
+        title_res = results[2]
+        count_res = results[3]
+        
         new_path = path_res.get("data", "") if path_res else ""
         new_pause = pause_res.get("data", False) if pause_res else False
-        if new_path != self.current_playing_path or new_pause != self.is_paused: self.update_playlist()
-        self.set_title(str(title_res.get('data')) if (title_res and "data" in title_res) else "MPV")
+        new_count = count_res.get("data", -1) if count_res else -1
+        
+        path_changed = (new_path != self.current_playing_path)
+        pause_changed = (new_pause != self.is_paused)
+        count_changed = (new_count >= 0 and new_count != len(self.full_list_data))
+
+        if count_changed or path_changed:
+            self.current_playing_path = new_path
+            self.is_paused = new_pause
+            self.update_playlist()
+        elif pause_changed:
+            self.is_paused = new_pause
+            self._update_playing_state_ui()
+
+        if title_res and "data" in title_res:
+            self.set_title(str(title_res.get('data')) or "MPV")
         return True
+
+    def _update_playing_state_ui(self):
+        with self.favorites_lock: fav_copy = set(self.favorites)
+        curr_p = self.current_playing_path
+        paused = self.is_paused
+        
+        for row in self.list_store:
+            fn = row[6]
+            nm = row[7]
+            is_p = (fn == curr_p)
+            is_f = (nm in fav_copy)
+            status_icon = "⏸ " if (is_p and paused) else ("▶ " if is_p else "")
+            dn = status_icon + ("★ " if is_f else "") + nm
+            bg, fg, w = ("#3584e4", "#ffffff", 800) if is_p else (None, None, 400)
+            
+            if row[0] != dn: row[0] = dn
+            if row[2] != w: row[2] = w
+            if row[4] != fg: row[4] = fg
+            if row[5] != bg: row[5] = bg
 
     def filter_func(self, model, tree_iter, data):
         # Opt #3: col 7 is the raw name (no prefix symbols)
@@ -640,7 +688,7 @@ class MPVGTKManager(Gtk.Window):
                 round_pb = Gdk.pixbuf_get_from_surface(surface, 0, 0, 60, 60)
                 with self.logo_lock:
                     if len(self.logo_cache) > 200:
-                        self.logo_cache = {k: v for k, v in self.logo_cache.items() if k.startswith("txt_")}
+                        self.logo_cache.clear()
                     self.logo_cache[url] = round_pb
                 GLib.idle_add(self._show_logo, round_pb, x, y)
             else:
@@ -655,6 +703,11 @@ class MPVGTKManager(Gtk.Window):
         self.logo_popup.show_all()
 
     def load_playlist_file(self, path, append=False):
+        cdef bint is_remote
+        cdef str lg, line, cn, cmd, cmd_type, temp_m3u, root, f_name
+        cdef list files
+        cdef tuple exts, pl_exts
+        
         if not path: return
         is_remote = path.startswith(('http://', 'https://', 'ftp://'))
         if not append: self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = {}, {}, {}, {}
@@ -665,14 +718,14 @@ class MPVGTKManager(Gtk.Window):
                     '.mp3', '.flac', '.wav', '.opus', '.ogg', '.m4a', '.aac', '.alac', '.wma', '.aiff', '.dsf', '.dff', '.ape', '.wv', '.tta', '.mpc', '.mka', '.m4b',
                     '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.svg')
             for root, dirs, fnames in os.walk(path):
-                for f in sorted(fnames):
-                    if f.lower().endswith(exts): files.append(os.path.join(root, f))
+                for f_name in sorted(fnames):
+                    if f_name.lower().endswith(exts): files.append(os.path.join(root, f_name))
             if files:
                 temp_m3u = ""
                 try:
                     with tempfile.NamedTemporaryFile(mode='w', suffix='.m3u', delete=False, encoding='utf-8') as tf:
                         tf.write('#EXTM3U\n')
-                        for f in files: tf.write(f + '\n')
+                        for f_name in files: tf.write(f_name + '\n')
                         temp_m3u = tf.name
                     cmd_type = "append" if append else "replace"
                     self.send_command({"command": ["loadlist", temp_m3u, cmd_type]})

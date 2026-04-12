@@ -275,7 +275,7 @@ class MPVQtManager(QMainWindow):
                 pix = QPixmap.fromImage(img).scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 with self.logo_lock:
                     if len(self.logo_cache) > 200:
-                        self.logo_cache = {k: v for k, v in self.logo_cache.items() if k.startswith("txt_")}
+                        self.logo_cache.clear()
                     self.logo_cache[url] = pix
                 self.signals.logo_loaded.emit(pix, pos)
             else:
@@ -359,7 +359,11 @@ class MPVQtManager(QMainWindow):
     def send_command(self, cmd, timeout=0.5, path=None):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
-                c.settimeout(timeout); c.connect(path or self.socket_path); c.sendall(json.dumps(cmd).encode() + b"\n")
+                c.settimeout(timeout)
+                c.connect(path or self.socket_path)
+                payload = dict(cmd)
+                payload["request_id"] = 999
+                c.sendall(json.dumps(payload).encode() + b"\n")
                 c.setblocking(False)
                 res = b""
                 while True:
@@ -374,7 +378,7 @@ class MPVQtManager(QMainWindow):
                                 if not line.strip(): continue
                                 try:
                                     data = json.loads(line.decode(errors="ignore"))
-                                    if any(k in data for k in ["request_id", "error", "data"]): return data
+                                    if data.get("request_id") == 999: return data
                                 except: continue
                             res = lines[-1]
                     else:
@@ -383,13 +387,20 @@ class MPVQtManager(QMainWindow):
         return None
 
     def send_commands_batch(self, cmds):
-        """Fire-and-forget batch send (no response needed, e.g. playlist-move)."""
+        """Fire-and-forget batch send; flush read buffer to prevent MPV stall."""
+        if not cmds: return None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
                 c.settimeout(1.0)
                 c.connect(self.socket_path)
                 for cmd in cmds:
                     c.sendall(json.dumps(cmd).encode() + b"\n")
+                c.setblocking(False)
+                while True:
+                    r, _, _ = select.select([c], [], [], 0.2)
+                    if r:
+                        if not c.recv(16384): break
+                    else: break
         except: pass
         return None
 
@@ -438,9 +449,10 @@ class MPVQtManager(QMainWindow):
 
     def _update_thread(self):
         # All cdef declarations must appear before any executable statements in Cython.
-        cdef int i, j, n
+        cdef int i, j, n, idx
+        cdef bint ps
         cdef int sm
-        cdef str cur_grp
+        cdef str cur_grp, cp, fn, nm, grp
         cdef list items = []
         cdef list move_cmds = []
         cdef dict gc = {}
@@ -610,25 +622,74 @@ class MPVQtManager(QMainWindow):
             self.tree_view.scrollTo(idx, QAbstractItemView.PositionAtCenter)
 
     def update_now_playing(self):
-        # Opt #2: fetch path, pause, media-title in ONE socket connection
         results = self.send_commands_batch_read([
             {"command": ["get_property", "path"]},
             {"command": ["get_property", "pause"]},
             {"command": ["get_property", "media-title"]},
+            {"command": ["get_property", "playlist-count"]},
         ])
-        path_res, pause_res, title_res = results
+        if not results: return
+        path_res, pause_res, title_res, count_res = results[0], results[1], results[2], results[3]
         new_path = path_res.get("data", "") if path_res else ""
         new_pause = pause_res.get("data", False) if pause_res else False
-        if new_path != self.current_playing_filename or new_pause != self.is_paused:
+        new_count = count_res.get("data", -1) if count_res else -1
+        
+        need_full_update = (new_count >= 0 and new_count != len(self.full_list))
+        
+        path_changed = (new_path != self.current_playing_filename)
+        pause_changed = (new_pause != self.is_paused)
+        
+        if need_full_update or path_changed:
             self.current_playing_filename = new_path
             self.is_paused = new_pause
             self.update_playlist()
+        elif pause_changed:
+            self.current_playing_filename = new_path
+            self.is_paused = new_pause
+            self._update_playing_state_ui()
+            
         if title_res and "data" in title_res:
-            self.setWindowTitle(str(title_res['data']))
+            self.setWindowTitle(str(title_res['data']) or "MPV")
+
+    def _update_playing_state_ui(self):
+        with self.lock: fc = set(self.favorites)
+        cp = self.current_playing_filename
+        ps = self.is_paused
+        for r in range(self.list_model.rowCount()):
+            item = self.list_model.item(r)
+            nm = item.data(self.RAW_NAME_ROLE)
+            match = next((x for x in self.full_list if x.name == nm), None)
+            if not match: continue
+            
+            isp = (match.filename == cp)
+            isf = nm in fc
+            dnm = (f"{'⏸ ' if ps else '▶ '}" if isp else "") + (f"★ {nm}" if isf else nm)
+            
+            if item.text() != dnm:
+                item.setText(dnm)
+                
+            has_bg = (item.background().style() != Qt.NoBrush)
+            if isp and not has_bg:
+                f = QFont()
+                f.setBold(True)
+                item.setFont(f)
+                item.setBackground(QColor("#3584e4"))
+                item.setForeground(QColor("#ffffff"))
+            elif not isp and has_bg:
+                f = QFont()
+                f.setBold(False)
+                item.setFont(f)
+                item.setBackground(QBrush())
+                item.setForeground(QBrush())
 
     def toggle_sort(self): self.sort_mode = 1 if self.sort_mode == 0 else 0; self.save_all_data(); self.update_playlist()
 
     def load_playlist_file(self, path, append=False):
+        cdef bint is_remote
+        cdef str lg, line, cn, cmd, cmd_type, temp_m3u, root, f_name
+        cdef list files
+        cdef tuple exts, pl_exts
+        
         if not path: return
         is_remote = path.startswith(('http://', 'https://', 'ftp://'))
         if not append: self.m3u_groups, self.url_to_group, self.m3u_logos, self.logo_cache = {}, {}, {}, {}
@@ -639,14 +700,14 @@ class MPVQtManager(QMainWindow):
                     '.mp3', '.flac', '.wav', '.opus', '.ogg', '.m4a', '.aac', '.alac', '.wma', '.aiff', '.dsf', '.dff', '.ape', '.wv', '.tta', '.mpc', '.mka', '.m4b',
                     '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff', '.svg')
             for root, dirs, fnames in os.walk(path):
-                for f in sorted(fnames):
-                    if f.lower().endswith(exts): files.append(os.path.join(root, f))
+                for f_name in sorted(fnames):
+                    if f_name.lower().endswith(exts): files.append(os.path.join(root, f_name))
             if files:
                 temp_m3u = ""
                 try:
                     with tempfile.NamedTemporaryFile(mode='w', suffix='.m3u', delete=False, encoding='utf-8') as tf:
                         tf.write('#EXTM3U\n')
-                        for f in files: tf.write(f + '\n')
+                        for f_name in files: tf.write(f_name + '\n')
                         temp_m3u = tf.name
                     cmd_type = "append" if append else "replace"
                     self.send_command({"command": ["loadlist", temp_m3u, cmd_type]})

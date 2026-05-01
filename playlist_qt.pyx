@@ -1,7 +1,7 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 import sys,socket,json,os,subprocess,re,threading,glob,urllib.request,tempfile,select
 from libc.stdlib cimport malloc,free
-from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLineEdit,QListView,QPushButton,QFileDialog,QAbstractItemView,QFrame,QMenu,QSlider,QLabel,QToolTip
+from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLineEdit,QListView,QPushButton,QFileDialog,QAbstractItemView,QFrame,QMenu,QSlider,QLabel,QToolTip,QInputDialog
 from PySide6.QtCore import Qt,QTimer,Signal,QObject,QPoint,QItemSelectionModel,QEvent,QRect
 from PySide6.QtGui import QStandardItemModel,QStandardItem,QColor,QFont,QIcon,QPixmap,QImage,QPainter,QFontMetrics,QBrush
 os.environ["QT_ACCESSIBILITY"]="0"
@@ -467,7 +467,7 @@ class MPVQtManager(QMainWindow):
         menu=QMenu(self)
         sort_labels={0:"Sort: A-Z",1:"Sort: Z-A"}
         current_sort_label=sort_labels.get(self.sort_mode,"Sort: A-Z")
-        for l,cb in [("Open Playlist",self.on_load_clicked),(current_sort_label,self.toggle_sort),("Refresh",self.update_playlist)]:
+        for l,cb in [("Open Playlist",self.on_load_clicked),("Load URL",self.on_load_url_clicked),(current_sort_label,self.toggle_sort),("Refresh",self.update_playlist)]:
             menu.addAction(l).triggered.connect(lambda chk=False,f=cb:f())
         menu.addSeparator()
         for l,state,cb in [("Show FAB",self.show_fab_enabled,self.toggle_fab_v),("Show Logos on Hover",self.show_logos_enabled,self.toggle_logos_v)]:
@@ -662,6 +662,9 @@ class MPVQtManager(QMainWindow):
     def on_load_clicked(self):
         p,_=QFileDialog.getOpenFileName(self,"Playlist","","All (*)")
         if p:self.load_playlist_file(p)
+    def on_load_url_clicked(self):
+        url,ok=QInputDialog.getText(self,"Load URL","Enter URL:")
+        if ok and url:self.load_playlist_file(url)
     def on_clear_clicked(self):
         self.send_command({"command":["playlist-clear"]})
         self.m3u_groups,self.url_to_group,self.m3u_logos,self.logo_cache={},{},{},{}

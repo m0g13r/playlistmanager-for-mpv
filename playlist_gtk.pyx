@@ -154,7 +154,7 @@ class MPVGTKManager(Gtk.Window):
         for c in self.main_menu.get_children():self.main_menu.remove(c)
         sort_labels={0:"Sort: A-Z",1:"Sort: Z-A"}
         current_sort_label=sort_labels.get(self.sort_mode,"Sort: A-Z")
-        for l,cb in [("Open Playlist",self.on_load_clicked),(current_sort_label,self.toggle_sort),("Refresh",lambda x:self.update_playlist()),("Clear Playlist",self.on_clear_clicked)]:
+        for l,cb in [("Open Playlist",self.on_load_clicked),("Load URL",self.on_load_url_clicked),(current_sort_label,self.toggle_sort),("Refresh",lambda x:self.update_playlist()),("Clear Playlist",self.on_clear_clicked)]:
             mi=Gtk.MenuItem(label=l)
             mi.connect("activate",cb)
             self.main_menu.append(mi)
@@ -486,6 +486,18 @@ class MPVGTKManager(Gtk.Window):
         diag=Gtk.FileChooserDialog(title="Select Playlist",parent=self,action=Gtk.FileChooserAction.OPEN)
         diag.add_buttons("_Cancel",Gtk.ResponseType.CANCEL,"_Open",Gtk.ResponseType.OK)
         if diag.run()==Gtk.ResponseType.OK:self.load_playlist_file(diag.get_filename())
+        diag.destroy()
+    def on_load_url_clicked(self,mi):
+        diag=Gtk.Dialog(title="Load URL",parent=self,flags=0)
+        diag.add_buttons("_Cancel",Gtk.ResponseType.CANCEL,"_OK",Gtk.ResponseType.OK)
+        diag.set_default_response(Gtk.ResponseType.OK)
+        entry=Gtk.Entry()
+        entry.set_activates_default(True)
+        diag.get_content_area().add(entry)
+        diag.show_all()
+        if diag.run()==Gtk.ResponseType.OK:
+            url=entry.get_text()
+            if url:self.load_playlist_file(url)
         diag.destroy()
     def on_clear_clicked(self,mi):
         self.send_command({"command":["playlist-clear"]})

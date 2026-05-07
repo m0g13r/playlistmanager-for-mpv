@@ -1,6 +1,5 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 import sys,socket,json,os,subprocess,re,gi,threading,glob,urllib.request,tempfile,select
-from libc.stdlib cimport malloc,free
 gi.require_version('Gtk','3.0')
 from gi.repository import Gtk,GLib,Gdk,GdkPixbuf,Pango,PangoCairo
 import cairo,math
@@ -26,6 +25,13 @@ class MPVGTKManager(Gtk.Window):
         self.config_file=os.path.expanduser("~/.mpv_gtk_config.json")
         self.favorites,self.m3u_groups,self.url_to_group,self.full_list_data,self.m3u_logos=set(),{},{},[],{}
         self.logo_cache={}
+        self._logo_hover_active=False
+        self._current_hover_url=None
+        self._last_hover_path=None
+        self._logo_timer_id=None
+        self._playlist_needs_sort=True
+        self._logo_sem=threading.Semaphore(4)
+        self.url_to_name={}
         self.file_lock,self.update_lock,self.favorites_lock,self.logo_lock=threading.Lock(),threading.Lock(),threading.Lock(),threading.Lock()
         self.sort_mode,self.current_playing_path,self.current_group,self.is_updating,self.resume_done,self.last_file_path,self.is_paused=0,"","All",False,False,"",False
         self.last_playlist_path=""
@@ -39,6 +45,7 @@ class MPVGTKManager(Gtk.Window):
         self._re_m3u_group=re.compile(r'group-title="([^"]+)"')
         self._re_m3u_logo=re.compile(r'tvg-logo="([^"]+)"')
         self._re_m3u_name=re.compile(r',(.+)$')
+        self._re_m3u_tvgname=re.compile(r'tvg-name="([^"]+)"')
         self.logo_popup=Gtk.Window(type=Gtk.WindowType.POPUP)
         self.logo_popup.set_decorated(False)
         self.logo_popup.set_skip_taskbar_hint(True)
@@ -89,8 +96,8 @@ class MPVGTKManager(Gtk.Window):
         self.tree_view.connect("button-release-event",self.on_click)
         self.tree_view.connect("key-press-event",self.on_key_press)
         self.tree_view.connect("motion-notify-event",self.on_mouse_motion)
-        self.tree_view.connect("leave-notify-event",lambda w,e:self.logo_popup.hide())
-        self.connect("leave-notify-event",lambda w,e:self.logo_popup.hide())
+        self.tree_view.connect("leave-notify-event",self._on_leave_hide_logo)
+        self.connect("leave-notify-event",self._on_leave_hide_logo)
         r_txt=Gtk.CellRendererText(xpad=8,ypad=6,ellipsize=3)
         self.tree_view.append_column(Gtk.TreeViewColumn("Name",r_txt,text=0,weight=2,foreground=4,background=5))
         self.scrolled.add(self.tree_view)
@@ -143,6 +150,19 @@ class MPVGTKManager(Gtk.Window):
         ctx.set_source_rgba(0,0,0,0)
         ctx.paint()
         return False
+    def _on_leave_hide_logo(self,widget,event):
+        if event.detail in (Gdk.NotifyType.INFERIOR,
+                            Gdk.NotifyType.VIRTUAL,
+                            Gdk.NotifyType.NONLINEAR_VIRTUAL):
+            return False
+        self._logo_hover_active=False
+        self._current_hover_url=None
+        self._last_hover_path=None
+        if self._logo_timer_id:
+            GLib.source_remove(self._logo_timer_id)
+            self._logo_timer_id=None
+        self.logo_popup.hide()
+        return False
     def apply_css(self):
         css=b".compact-header{min-height:24px;padding:0;}.compact-header button{padding:1px 2px;min-height:20px;min-width:20px;}.compact-header entry{min-height:20px;margin:2px 0;}.fab-button{border-radius:50%;border:none;padding:0;transition:all 150ms ease;box-shadow:none;}.fab-trigger{min-width:32px;min-height:32px;background:rgba(53,132,228,0.7);color:white;}.fab-trigger:hover{background:rgba(53,132,228,0.9);}.fab-small{min-width:28px;min-height:28px;background:rgba(60,60,60,0.6);color:white;}.fab-small:hover{background:rgba(80,80,80,0.8);}.fab-shuffle{min-width:28px;min-height:28px;background:rgba(60,60,60,0.6);color:#444444;}.fab-shuffle:hover{background:rgba(80,80,80,0.8);}.fab-vol-slider{background:rgba(60,60,60,0.6);border-radius:14px;padding:12px 0;}scale.fab-vol-slider contents trough{background:rgba(255,255,255,0.2);min-width:4px;border-radius:2px;margin:0 12px;}scale.fab-vol-slider contents trough highlight{background:#3584e4;border-radius:2px;}scale.fab-vol-slider contents trough slider{background:#3584e4;min-width:12px;min-height:12px;border-radius:50%;margin:-4px;border:none;box-shadow:none;}treeview{background-color:transparent;}treeview selection{border-radius:8px;}treeview:selected{border-radius:8px;background-color:#3584e4;color:white;}"
         p=Gtk.CssProvider()
@@ -154,7 +174,7 @@ class MPVGTKManager(Gtk.Window):
         for c in self.main_menu.get_children():self.main_menu.remove(c)
         sort_labels={0:"Sort: A-Z",1:"Sort: Z-A"}
         current_sort_label=sort_labels.get(self.sort_mode,"Sort: A-Z")
-        for l,cb in [("Open Playlist",self.on_load_clicked),("Load URL",self.on_load_url_clicked),(current_sort_label,self.toggle_sort),("Refresh",lambda x:self.update_playlist()),("Clear Playlist",self.on_clear_clicked)]:
+        for l,cb in [("Open Playlist",self.on_load_clicked),("Load URL",self.on_load_url_clicked),(current_sort_label,self.toggle_sort),("Refresh",self.on_refresh_clicked),("Clear Playlist",self.on_clear_clicked)]:
             mi=Gtk.MenuItem(label=l)
             mi.connect("activate",cb)
             self.main_menu.append(mi)
@@ -301,14 +321,12 @@ class MPVGTKManager(Gtk.Window):
             self.is_updating=True
         threading.Thread(target=self._update_thread,daemon=True).start()
     def _update_thread(self):
-        cdef int i,j,n,idx,sm
+        cdef int idx,sm
         cdef bint paused
         cdef str cur_grp,curr_p,fn,name,grp
         cdef dict group_counts={}
         cdef list items=[]
         cdef list move_cmds=[]
-        cdef PlaylistItem it
-        cdef int* c_orig_idx=NULL
         try:
             results=self.send_commands_batch_read([{"command":["get_property","playlist"]},{"command":["get_property","path"]},{"command":["get_property","pause"]}])
             res=results[0] if results else None
@@ -321,13 +339,14 @@ class MPVGTKManager(Gtk.Window):
                 return
             with self.favorites_lock:fav_copy=set(self.favorites)
             url_to_group=self.url_to_group
+            url_to_name=self.url_to_name
             m3u_groups=self.m3u_groups
             _normalize=self._normalize
             _get_nkey=self._get_nkey
             for idx,entry in enumerate(res["data"]):
                 fn=entry.get("filename","")
-                name=(entry.get("title") or os.path.basename(fn)).strip()
-                grp=url_to_group.get(fn) or m3u_groups.get(_normalize(name)) or "Uncategorized"
+                name=(url_to_name.get(fn) or entry.get("title") or os.path.basename(fn)).strip()
+                grp=url_to_group.get(fn) or m3u_groups.get(name) or m3u_groups.get(_normalize(name)) or "Uncategorized"
                 group_counts[grp]=group_counts.get(grp,0)+1
                 items.append(PlaylistItem(name,fn,idx,grp,_get_nkey(name)))
             sm=self.sort_mode
@@ -342,24 +361,18 @@ class MPVGTKManager(Gtk.Window):
                 items.sort(key=sort_key)
             n=len(items)
             if n>0:
-                c_orig_idx=<int*>malloc(n*sizeof(int))
-                if c_orig_idx!=NULL:
-                    try:
-                        for i in range(n):
-                            it=<PlaylistItem>items[i]
-                            c_orig_idx[i]=it.orig_idx
-                        for i in range(n):
-                            if c_orig_idx[i]!=i:
-                                move_cmds.append({"command":["playlist-move",c_orig_idx[i],i]})
-                                for j in range(n):
-                                    if c_orig_idx[j]<c_orig_idx[i] and c_orig_idx[j]>=i:c_orig_idx[j]+=1
-                                    elif c_orig_idx[j]>c_orig_idx[i] and c_orig_idx[j]<=i:c_orig_idx[j]-=1
-                                c_orig_idx[i]=i
-                        for i in range(n):
-                            it=<PlaylistItem>items[i]
-                            it.orig_idx=i
-                    finally:free(c_orig_idx)
-            if move_cmds:self.send_commands_batch(move_cmds)
+                target_state = [it.orig_idx for it in items]
+                current_mpv_state = list(range(n))
+                for i in range(n):
+                    if current_mpv_state[i] != target_state[i]:
+                        current_pos = current_mpv_state.index(target_state[i], i)
+                        move_cmds.append({"command":["playlist-move", current_pos, i]})
+                        current_mpv_state.insert(i, current_mpv_state.pop(current_pos))
+                for i in range(n):
+                    items[i].orig_idx = i
+            if move_cmds and self._playlist_needs_sort:
+                self.send_commands_batch(move_cmds)
+                self._playlist_needs_sort=False
             GLib.idle_add(self._finalize_update,group_counts,items,curr_p,paused)
         except Exception:GLib.idle_add(self._set_updating_false)
     def _set_updating_false(self):
@@ -436,11 +449,12 @@ class MPVGTKManager(Gtk.Window):
         path_changed=(new_path!=self.current_playing_path)
         pause_changed=(new_pause!=self.is_paused)
         count_changed=(new_count>=0 and new_count!=len(self.full_list_data))
-        if count_changed or path_changed:
+        if count_changed:
             self.current_playing_path=new_path
             self.is_paused=new_pause
             self.update_playlist()
-        elif pause_changed:
+        elif path_changed or pause_changed:
+            self.current_playing_path=new_path
             self.is_paused=new_pause
             self._update_playing_state_ui()
         if title_res and "data" in title_res:self.set_title(str(title_res.get('data')) or "MPV")
@@ -479,6 +493,7 @@ class MPVGTKManager(Gtk.Window):
         return sq in model.get_value(tree_iter,8)
     def toggle_sort(self,mi):
         self.sort_mode=1 if self.sort_mode==0 else 0
+        self._playlist_needs_sort=True
         self.rebuild_main_menu()
         self.save_all_data()
         self.update_playlist()
@@ -501,7 +516,7 @@ class MPVGTKManager(Gtk.Window):
         diag.destroy()
     def on_clear_clicked(self,mi):
         self.send_command({"command":["playlist-clear"]})
-        self.m3u_groups,self.url_to_group,self.m3u_logos,self.logo_cache={},{},{},{}
+        self.m3u_groups,self.url_to_group,self.m3u_logos,self.logo_cache,self.url_to_name={},{},{},{},{}
         self.update_playlist()
     def on_click(self,tree,event):
         pi=tree.get_path_at_pos(int(event.x),int(event.y))
@@ -534,16 +549,47 @@ class MPVGTKManager(Gtk.Window):
         if not self.show_logos_enabled:return False
         res=tree.get_path_at_pos(int(event.x),int(event.y))
         if res:
+            path_str = res[0].to_string()
+            if self._last_hover_path == path_str:
+                if self.logo_popup.get_visible():
+                    self.logo_popup.move(event.x_root+20, event.y_root+10)
+                return False
+            self._last_hover_path = path_str
+            self._logo_hover_active=True
             f_iter=self.filter.get_iter(res[0])
             name=self.filter.get_value(f_iter,7)
             url=self.m3u_logos.get(name)
+            # Cancel any pending timer
+            if self._logo_timer_id:
+                GLib.source_remove(self._logo_timer_id)
+                self._logo_timer_id=None
             if url:
                 with self.logo_lock:cached=self.logo_cache.get(url)
-                if cached:self._show_logo(cached,event.x_root,event.y_root)
-                else:threading.Thread(target=self._load_logo_async,args=(url,event.x_root,event.y_root,name),daemon=True).start()
-            else:self._show_logo(self._get_text_placeholder(name),event.x_root,event.y_root)
+                if cached:
+                    # Cached: show immediately at current position
+                    self._show_logo(cached,event.x_root,event.y_root)
+                else:
+                    # Not cached: wait 200ms before loading to avoid spam
+                    self._current_hover_url=url
+                    self._logo_timer_id=GLib.timeout_add(200,self._logo_timer_cb,url,name,int(event.x_root),int(event.y_root))
+            else:
+                self._current_hover_url=None
+                self._show_logo(self._get_text_placeholder(name),event.x_root,event.y_root)
             return False
+        self._last_hover_path = None
+        self._logo_hover_active=False
+        self._current_hover_url=None
+        if self._logo_timer_id:
+            GLib.source_remove(self._logo_timer_id)
+            self._logo_timer_id=None
         self.logo_popup.hide()
+        return False
+    def _logo_timer_cb(self,url,name,x,y):
+        self._logo_timer_id=None
+        if not self._logo_hover_active or url!=self._current_hover_url:return False
+        with self.logo_lock:cached=self.logo_cache.get(url)
+        if cached:self._show_logo(cached,x,y)
+        else:threading.Thread(target=self._load_logo_async,args=(url,x,y,name),daemon=True).start()
         return False
     def _get_text_placeholder(self,name):
         cache_key="txt_"+name
@@ -573,44 +619,98 @@ class MPVGTKManager(Gtk.Window):
         self.logo_cache[cache_key]=pb
         return pb
     def _load_logo_async(self,url,x,y,name):
-        try:
-            if url.startswith("http"):
-                req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
-                data=urllib.request.urlopen(req,timeout=1).read()
-                loader=GdkPixbuf.PixbufLoader()
-                try:
-                    loader.write(data)
-                    loader.close()
-                    pb=loader.get_pixbuf()
-                except:
-                    try:loader.close()
-                    except:pass
-                    pb=None
-            else:pb=GdkPixbuf.Pixbuf.new_from_file(url)
-            if pb:
-                orig_w,orig_h=pb.get_width(),pb.get_height()
-                scale=min(50/orig_w,50/orig_h)
-                nw,nh=max(1,int(orig_w*scale)),max(1,int(orig_h*scale))
-                pb=pb.scale_simple(nw,nh,GdkPixbuf.InterpType.BILINEAR)
-                surface=cairo.ImageSurface(cairo.FORMAT_ARGB32,60,60)
-                ctx=cairo.Context(surface)
-                ctx.arc(30,30,30,0,2*math.pi)
-                ctx.set_source_rgba(0,0,0,0.5)
-                ctx.fill()
-                Gdk.cairo_set_source_pixbuf(ctx,pb,(60-nw)/2,(60-nh)/2)
-                ctx.paint()
-                round_pb=Gdk.pixbuf_get_from_surface(surface,0,0,60,60)
-                with self.logo_lock:
-                    if len(self.logo_cache)>200:self.logo_cache.clear()
-                    self.logo_cache[url]=round_pb
-                GLib.idle_add(self._show_logo,round_pb,x,y)
-            else:GLib.idle_add(self._show_logo,self._get_text_placeholder(name),x,y)
-        except:GLib.idle_add(self._show_logo,self._get_text_placeholder(name),x,y)
+        with self._logo_sem:
+            # Discard if mouse has already moved to a different item
+            if url!=self._current_hover_url:return
+            try:
+                if url.startswith("http"):
+                    req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
+                    data=urllib.request.urlopen(req,timeout=1).read()
+                    loader=GdkPixbuf.PixbufLoader()
+                    try:
+                        loader.write(data)
+                        loader.close()
+                        pb=loader.get_pixbuf()
+                    except:
+                        try:loader.close()
+                        except:pass
+                        pb=None
+                else:pb=GdkPixbuf.Pixbuf.new_from_file(url)
+                if pb:
+                    orig_w,orig_h=pb.get_width(),pb.get_height()
+                    scale=min(50/orig_w,50/orig_h)
+                    nw,nh=max(1,int(orig_w*scale)),max(1,int(orig_h*scale))
+                    pb=pb.scale_simple(nw,nh,GdkPixbuf.InterpType.BILINEAR)
+                    surface=cairo.ImageSurface(cairo.FORMAT_ARGB32,60,60)
+                    ctx=cairo.Context(surface)
+                    ctx.arc(30,30,30,0,2*math.pi)
+                    ctx.set_source_rgba(0,0,0,0.5)
+                    ctx.fill()
+                    Gdk.cairo_set_source_pixbuf(ctx,pb,(60-nw)/2,(60-nh)/2)
+                    ctx.paint()
+                    round_pb=Gdk.pixbuf_get_from_surface(surface,0,0,60,60)
+                    with self.logo_lock:
+                        if len(self.logo_cache)>200:self.logo_cache.clear()
+                        self.logo_cache[url]=round_pb
+                    GLib.idle_add(self._show_logo,round_pb,x,y)
+                else:GLib.idle_add(self._show_logo,self._get_text_placeholder(name),x,y)
+            except:GLib.idle_add(self._show_logo,self._get_text_placeholder(name),x,y)
     def _show_logo(self,pb,x,y):
-        if not self.show_logos_enabled:return
+        if not self.show_logos_enabled or not self._logo_hover_active:return
         self.logo_image.set_from_pixbuf(pb)
         self.logo_popup.move(x+20,y+10)
         self.logo_popup.show_all()
+    def on_refresh_clicked(self,mi):
+        if self.last_playlist_path:
+            path_res=self.send_command({"command":["get_property","path"]})
+            if path_res and path_res.get("data"):
+                self.last_file_path=path_res["data"]
+            self.resume_done=False
+            self.load_playlist_file(self.last_playlist_path)
+        else:
+            self.update_playlist()
+    def _parse_m3u_lines(self,lines):
+        cdef str lg,line,cn,tvgn,last_name
+        re_group=self._re_m3u_group
+        re_logo=self._re_m3u_logo
+        re_name=self._re_m3u_name
+        re_tvgname=self._re_m3u_tvgname
+        _normalize=self._normalize
+        new_groups={}
+        new_url={}
+        new_logos={}
+        new_url_to_name={}
+        lg="Uncategorized"
+        last_name=""
+        for line in lines:
+            line=line.strip()
+            if line.startswith("#EXTINF"):
+                m=re_group.search(line)
+                logo=re_logo.search(line)
+                nm=re_name.search(line)
+                tvg=re_tvgname.search(line)
+                lg=m.group(1) if m else "Uncategorized"
+                last_name=""
+                if tvg:
+                    tvgn=tvg.group(1).strip()
+                    new_groups[_normalize(tvgn)]=lg
+                    new_groups[tvgn]=lg
+                    if logo:new_logos[tvgn]=logo.group(1)
+                    last_name=tvgn
+                if nm:
+                    cn=nm.group(1).strip()
+                    new_groups[_normalize(cn)]=lg
+                    new_groups[cn]=lg
+                    if logo:new_logos[cn]=logo.group(1)
+                    if not last_name:last_name=cn
+            elif line and not line.startswith("#"):
+                new_url[line]=lg
+                if last_name:new_url_to_name[line]=last_name
+                last_name=""
+        self.m3u_groups=new_groups
+        self.url_to_group=new_url
+        self.m3u_logos=new_logos
+        self.url_to_name=new_url_to_name
     def load_playlist_file(self,path,append=False):
         cdef bint is_remote
         cdef str lg,line,cn,cmd,cmd_type,temp_m3u,root,f_name
@@ -618,7 +718,7 @@ class MPVGTKManager(Gtk.Window):
         cdef tuple exts,pl_exts
         if not path:return
         is_remote=path.startswith(('http://','https://','ftp://'))
-        if not append:self.m3u_groups,self.url_to_group,self.m3u_logos,self.logo_cache={},{},{},{}
+        if not append:self.logo_cache={}
         if not is_remote and os.path.isdir(path):
             files=[]
             exts=('.mkv','.mp4','.webm','.avi','.mov','.flv','.wmv','.ts','.m2ts','.mts','.vob','.ogv','.qt','.rmvb','.asf','.amv','.m4v','.mpg','.mpeg','.m2v','.divx','.3gp','.3g2','.mp3','.flac','.wav','.opus','.ogg','.m4a','.aac','.alac','.wma','.aiff','.dsf','.dff','.ape','.wv','.tta','.mpc','.mka','.m4b','.jpg','.jpeg','.png','.webp','.gif','.bmp','.tiff','.svg')
@@ -646,32 +746,26 @@ class MPVGTKManager(Gtk.Window):
         else:
             pl_exts=('.m3u','.m3u8','.pls','.xspf','.cue','.asx','.txt')
             cmd_type="append" if append else "replace"
-            if not is_remote and os.path.exists(path) and path.lower().split('?')[0].endswith(pl_exts):
+            if not is_remote and os.path.exists(path) and path.lower().split("?")[0].endswith(pl_exts):
                 try:
-                    re_group=self._re_m3u_group
-                    re_logo=self._re_m3u_logo
-                    re_name=self._re_m3u_name
-                    with open(path,'r',encoding='utf-8',errors='ignore') as f:
-                        lg="Uncategorized"
-                        for line in f:
-                            line=line.strip()
-                            if line.startswith("#EXTINF"):
-                                m=re_group.search(line)
-                                logo=re_logo.search(line)
-                                nm=re_name.search(line)
-                                lg=m.group(1) if m else "Uncategorized"
-                                if nm:
-                                    cn=nm.group(1).strip()
-                                    self.m3u_groups[self._normalize(cn)]=lg
-                                    if logo:self.m3u_logos[cn]=logo.group(1)
-                            elif line and not line.startswith("#"):self.url_to_group[line]=lg
+                    with open(path,"r",encoding="utf-8",errors="ignore") as f:
+                        self._parse_m3u_lines(f)
                 except:pass
-            cmd="loadlist" if path.lower().split('?')[0].endswith(pl_exts) else "loadfile"
+            elif is_remote:
+                try:
+                    req=urllib.request.Request(path,headers={"User-Agent":"Mozilla/5.0"})
+                    data=urllib.request.urlopen(req,timeout=15).read().decode("utf-8",errors="ignore")
+                    if "#EXTINF" in data:
+                        self._parse_m3u_lines(data.splitlines())
+                except:pass
+            cmd="loadlist" if (not is_remote and path.lower().split("?")[0].endswith(pl_exts)) or (is_remote and bool(self.url_to_group)) else "loadfile"
             self.send_command({"command":[cmd,path,cmd_type]})
-        if not append:self.last_playlist_path=path
+        if not append:
+            self.last_playlist_path=path
+            self._playlist_needs_sort=True
         self.save_all_data()
         self.send_command({"command":["set_property","pause",False]})
-        GLib.timeout_add(500,self.update_playlist)
+        GLib.timeout_add(1500,self.update_playlist)
     def load_all_data(self):
         try:
             if os.path.exists(self.config_file):

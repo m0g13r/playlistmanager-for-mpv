@@ -1,6 +1,5 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 import sys,socket,json,os,subprocess,re,threading,glob,urllib.request,tempfile,select
-from libc.stdlib cimport malloc,free
 from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QLineEdit,QListView,QPushButton,QFileDialog,QAbstractItemView,QFrame,QMenu,QSlider,QLabel,QToolTip,QInputDialog
 from PySide6.QtCore import Qt,QTimer,Signal,QObject,QPoint,QItemSelectionModel,QEvent,QRect
 from PySide6.QtGui import QStandardItemModel,QStandardItem,QColor,QFont,QIcon,QPixmap,QImage,QPainter,QFontMetrics,QBrush
@@ -67,10 +66,18 @@ class MPVQtManager(QMainWindow):
         self._re_m3u_group=re.compile(r'group-title="([^"]+)"')
         self._re_m3u_logo=re.compile(r'tvg-logo="([^"]+)"')
         self._re_m3u_name=re.compile(r',(.+)$')
+        self._re_m3u_tvgname=re.compile(r'tvg-name="([^"]+)"')
         self.favorites,self.m3u_groups,self.url_to_group,self.m3u_logos,self.logo_cache=set(),{},{},{},{}
+        self.url_to_name={}
         self.sort_mode,self.current_playing_filename,self.is_paused,self.current_group=0,"",False,"All"
         self.full_list,self.group_counts,self.is_updating,self.resume_done,self.last_file,self.last_playlist_path=[],{},False,False,"",""
         self.show_fab_enabled,self.show_logos_enabled=True,True
+        self._logo_hover_active=False
+        self._current_hover_url=None
+        self._last_hover_idx=None
+        self._logo_timer_id=None
+        self._playlist_needs_sort=True
+        self._logo_sem=threading.Semaphore(4)
         self.update_lock=threading.Lock()
         self.logo_lock=threading.Lock()
         self.is_probing_sockets=False
@@ -175,18 +182,57 @@ class MPVQtManager(QMainWindow):
             if et==QEvent.MouseMove and self.show_logos_enabled:
                 idx=self.tree_view.indexAt(event.position().toPoint())
                 if idx.isValid():
+                    if self._last_hover_idx == idx:
+                        if not self.logo_label.isHidden():
+                            self.logo_label.move(event.globalPosition().toPoint().x()+15, event.globalPosition().toPoint().y()+15)
+                        return False
+                    self._last_hover_idx = idx
+                    self._logo_hover_active=True
                     name=self.list_model.itemFromIndex(idx).data(self.RAW_NAME_ROLE)
                     url=self.m3u_logos.get(name)
                     pos=event.globalPosition().toPoint()
+                    # Cancel pending timer
+                    if self._logo_timer_id is not None:
+                        self._logo_timer_id.stop()
+                        self._logo_timer_id=None
                     if url:
                         with self.logo_lock:cached=self.logo_cache.get(url)
-                        if cached:self._show_logo_popup(cached,pos)
-                        else:threading.Thread(target=self._load_logo_async,args=(url,pos,name),daemon=True).start()
-                    else:self._show_logo_popup(self._get_text_placeholder(name),pos)
+                        if cached:
+                            self._show_logo_popup(cached,pos)
+                        else:
+                            self._current_hover_url=url
+                            t=QTimer()
+                            t.setSingleShot(True)
+                            t.timeout.connect(lambda u=url,n=name,p=pos:self._logo_timer_cb(u,n,p))
+                            t.start(200)
+                            self._logo_timer_id=t
+                    else:
+                        self._current_hover_url=None
+                        self._show_logo_popup(self._get_text_placeholder(name),pos)
                     return False
-                else:self.logo_label.hide()
-            elif et in (QEvent.Leave,QEvent.Wheel):self.logo_label.hide()
+                else:
+                    self._last_hover_idx=None
+                    self._logo_hover_active=False
+                    self._current_hover_url=None
+                    if self._logo_timer_id is not None:
+                        self._logo_timer_id.stop()
+                        self._logo_timer_id=None
+                    self.logo_label.hide()
+            elif et in (QEvent.Leave,QEvent.Wheel):
+                self._last_hover_idx=None
+                self._logo_hover_active=False
+                self._current_hover_url=None
+                if self._logo_timer_id is not None:
+                    self._logo_timer_id.stop()
+                    self._logo_timer_id=None
+                self.logo_label.hide()
         return super().eventFilter(source,event)
+    def _logo_timer_cb(self,url,name,pos):
+        self._logo_timer_id=None
+        if not self._logo_hover_active or url!=self._current_hover_url:return
+        with self.logo_lock:cached=self.logo_cache.get(url)
+        if cached:self._show_logo_popup(cached,pos)
+        else:threading.Thread(target=self._load_logo_async,args=(url,pos,name),daemon=True).start()
     def _get_text_placeholder(self,name):
         cache_key="txt_"+name
         if cache_key in self.logo_cache:return self.logo_cache[cache_key]
@@ -210,21 +256,23 @@ class MPVQtManager(QMainWindow):
         self.logo_cache[cache_key]=pix
         return pix
     def _load_logo_async(self,url,pos,name):
-        try:
-            if url.startswith("http"):
-                data=urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'}),timeout=1).read()
-                img=QImage.fromData(data)
-            else:img=QImage(url)
-            if not img.isNull():
-                pix=QPixmap.fromImage(img).scaled(64,64,Qt.KeepAspectRatio,Qt.SmoothTransformation)
-                with self.logo_lock:
-                    if len(self.logo_cache)>200:self.logo_cache.clear()
-                    self.logo_cache[url]=pix
-                self.signals.logo_loaded.emit(pix,pos)
-            else:self.signals.logo_loaded.emit(name,pos)
-        except:self.signals.logo_loaded.emit(name,pos)
+        with self._logo_sem:
+            if url!=self._current_hover_url:return
+            try:
+                if url.startswith("http"):
+                    data=urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'}),timeout=1).read()
+                    img=QImage.fromData(data)
+                else:img=QImage(url)
+                if not img.isNull():
+                    pix=QPixmap.fromImage(img).scaled(64,64,Qt.KeepAspectRatio,Qt.SmoothTransformation)
+                    with self.logo_lock:
+                        if len(self.logo_cache)>200:self.logo_cache.clear()
+                        self.logo_cache[url]=pix
+                    self.signals.logo_loaded.emit(pix,pos)
+                else:self.signals.logo_loaded.emit(name,pos)
+            except:self.signals.logo_loaded.emit(name,pos)
     def _show_logo_popup(self,img_or_name,pos):
-        if not self.tree_view.underMouse() or not self.show_logos_enabled:return
+        if not self._logo_hover_active or not self.show_logos_enabled:return
         if isinstance(img_or_name,str):pix=self._get_text_placeholder(img_or_name)
         else:pix=img_or_name
         self.logo_label.setPixmap(pix)
@@ -370,14 +418,12 @@ class MPVQtManager(QMainWindow):
             self.is_updating=True
         threading.Thread(target=self._update_thread,daemon=True).start()
     def _update_thread(self):
-        cdef int i,j,n,idx,sm
+        cdef int idx,sm
         cdef bint ps
         cdef str cur_grp,cp,fn,nm,grp
         cdef list items=[]
         cdef list move_cmds=[]
         cdef dict gc={}
-        cdef PlaylistItem it
-        cdef int* c_orig_idx=NULL
         try:
             results=self.send_commands_batch_read([{"command":["get_property","playlist"]},{"command":["get_property","path"]},{"command":["get_property","pause"]}])
             res=results[0] if results else None
@@ -390,13 +436,14 @@ class MPVQtManager(QMainWindow):
                 return
             with self.lock:fc=set(self.favorites)
             url_to_group=self.url_to_group
+            url_to_name=self.url_to_name
             m3u_groups=self.m3u_groups
             _normalize=self._normalize
             _get_nkey=self._get_nkey
             for idx,entry in enumerate(res["data"]):
                 fn=entry.get("filename","")
-                nm=(entry.get("title") or os.path.basename(fn)).strip()
-                grp=url_to_group.get(fn) or m3u_groups.get(_normalize(nm)) or "Uncategorized"
+                nm=(url_to_name.get(fn) or entry.get("title") or os.path.basename(fn)).strip()
+                grp=url_to_group.get(fn) or m3u_groups.get(nm) or m3u_groups.get(_normalize(nm)) or "Uncategorized"
                 gc[grp]=gc.get(grp,0)+1
                 items.append(PlaylistItem(nm,fn,idx,grp,_get_nkey(nm)))
             cur_grp=self.current_group
@@ -411,24 +458,18 @@ class MPVQtManager(QMainWindow):
                 items.sort(key=sort_key)
             n=len(items)
             if n>0:
-                c_orig_idx=<int*>malloc(n*sizeof(int))
-                if c_orig_idx!=NULL:
-                    try:
-                        for i in range(n):
-                            it=<PlaylistItem>items[i]
-                            c_orig_idx[i]=it.orig_idx
-                        for i in range(n):
-                            if c_orig_idx[i]!=i:
-                                move_cmds.append({"command":["playlist-move",c_orig_idx[i],i]})
-                                for j in range(n):
-                                    if c_orig_idx[j]<c_orig_idx[i] and c_orig_idx[j]>=i:c_orig_idx[j]+=1
-                                    elif c_orig_idx[j]>c_orig_idx[i] and c_orig_idx[j]<=i:c_orig_idx[j]-=1
-                                c_orig_idx[i]=i
-                        for i in range(n):
-                            it=<PlaylistItem>items[i]
-                            it.orig_idx=i
-                    finally:free(c_orig_idx)
-            if move_cmds:self.send_commands_batch(move_cmds)
+                target_state = [it.orig_idx for it in items]
+                current_mpv_state = list(range(n))
+                for i in range(n):
+                    if current_mpv_state[i] != target_state[i]:
+                        current_pos = current_mpv_state.index(target_state[i], i)
+                        move_cmds.append({"command":["playlist-move", current_pos, i]})
+                        current_mpv_state.insert(i, current_mpv_state.pop(current_pos))
+                for i in range(n):
+                    items[i].orig_idx = i
+            if move_cmds and self._playlist_needs_sort:
+                self.send_commands_batch(move_cmds)
+                self._playlist_needs_sort=False
             self.signals.finished.emit(gc,items,cp,ps)
         except Exception:
             with self.update_lock:self.is_updating=False
@@ -467,7 +508,7 @@ class MPVQtManager(QMainWindow):
         menu=QMenu(self)
         sort_labels={0:"Sort: A-Z",1:"Sort: Z-A"}
         current_sort_label=sort_labels.get(self.sort_mode,"Sort: A-Z")
-        for l,cb in [("Open Playlist",self.on_load_clicked),("Load URL",self.on_load_url_clicked),(current_sort_label,self.toggle_sort),("Refresh",self.update_playlist)]:
+        for l,cb in [("Open Playlist",self.on_load_clicked),("Load URL",self.on_load_url_clicked),(current_sort_label,self.toggle_sort),("Refresh",self.on_refresh_clicked)]:
             menu.addAction(l).triggered.connect(lambda chk=False,f=cb:f())
         menu.addSeparator()
         for l,state,cb in [("Show FAB",self.show_fab_enabled,self.toggle_fab_v),("Show Logos on Hover",self.show_logos_enabled,self.toggle_logos_v)]:
@@ -546,11 +587,11 @@ class MPVQtManager(QMainWindow):
         need_full_update=(new_count>=0 and new_count!=len(self.full_list))
         path_changed=(new_path!=self.current_playing_filename)
         pause_changed=(new_pause!=self.is_paused)
-        if need_full_update or path_changed:
+        if need_full_update:
             self.current_playing_filename=new_path
             self.is_paused=new_pause
             self.update_playlist()
-        elif pause_changed:
+        elif path_changed or pause_changed:
             self.current_playing_filename=new_path
             self.is_paused=new_pause
             self._update_playing_state_ui()
@@ -584,8 +625,60 @@ class MPVQtManager(QMainWindow):
                 item.setForeground(no_brush)
     def toggle_sort(self):
         self.sort_mode=1 if self.sort_mode==0 else 0
+        self._playlist_needs_sort=True
         self.save_all_data()
         self.update_playlist()
+    def on_refresh_clicked(self):
+        if self.last_playlist_path:
+            pr=self.send_command({"command":["get_property","path"]})
+            if pr and pr.get("data"):
+                self.last_file=pr["data"]
+            self.resume_done=False
+            self.load_playlist_file(self.last_playlist_path)
+        else:
+            self.update_playlist()
+    def _parse_m3u_lines(self,lines):
+        cdef str lg,line,cn,tvgn,last_name
+        re_group=self._re_m3u_group
+        re_logo=self._re_m3u_logo
+        re_name=self._re_m3u_name
+        re_tvgname=self._re_m3u_tvgname
+        _normalize=self._normalize
+        new_groups={}
+        new_url={}
+        new_logos={}
+        new_url_to_name={}
+        lg="Uncategorized"
+        last_name=""
+        for line in lines:
+            line=line.strip()
+            if line.startswith("#EXTINF"):
+                m=re_group.search(line)
+                logo=re_logo.search(line)
+                nm=re_name.search(line)
+                tvg=re_tvgname.search(line)
+                lg=m.group(1) if m else "Uncategorized"
+                last_name=""
+                if tvg:
+                    tvgn=tvg.group(1).strip()
+                    new_groups[_normalize(tvgn)]=lg
+                    new_groups[tvgn]=lg
+                    if logo:new_logos[tvgn]=logo.group(1)
+                    last_name=tvgn
+                if nm:
+                    cn=nm.group(1).strip()
+                    new_groups[_normalize(cn)]=lg
+                    new_groups[cn]=lg
+                    if logo:new_logos[cn]=logo.group(1)
+                    if not last_name:last_name=cn
+            elif line and not line.startswith("#"):
+                new_url[line]=lg
+                if last_name:new_url_to_name[line]=last_name
+                last_name=""
+        self.m3u_groups=new_groups
+        self.url_to_group=new_url
+        self.m3u_logos=new_logos
+        self.url_to_name=new_url_to_name
     def load_playlist_file(self,path,append=False):
         cdef bint is_remote
         cdef str lg,line,cn,cmd,cmd_type,temp_m3u,root,f_name
@@ -593,7 +686,7 @@ class MPVQtManager(QMainWindow):
         cdef tuple exts,pl_exts
         if not path:return
         is_remote=path.startswith(('http://','https://','ftp://'))
-        if not append:self.m3u_groups,self.url_to_group,self.m3u_logos,self.logo_cache={},{},{},{}
+        if not append:self.logo_cache={}
         if not is_remote and os.path.isdir(path):
             files=[]
             exts=('.mkv','.mp4','.webm','.avi','.mov','.flv','.wmv','.ts','.m2ts','.mts','.vob','.ogv','.qt','.rmvb','.asf','.amv','.m4v','.mpg','.mpeg','.m2v','.divx','.3gp','.3g2','.mp3','.flac','.wav','.opus','.ogg','.m4a','.aac','.alac','.wma','.aiff','.dsf','.dff','.ape','.wv','.tta','.mpc','.mka','.m4b','.jpg','.jpeg','.png','.webp','.gif','.bmp','.tiff','.svg')
@@ -617,32 +710,25 @@ class MPVQtManager(QMainWindow):
         else:
             pl_exts=('.m3u','.m3u8','.pls','.xspf','.cue','.asx','.txt')
             cmd_type="append" if append else "replace"
-            if not is_remote and os.path.exists(path) and path.lower().split('?')[0].endswith(pl_exts):
+            if not is_remote and os.path.exists(path) and path.lower().split("?")[0].endswith(pl_exts):
                 try:
-                    re_group=self._re_m3u_group
-                    re_logo=self._re_m3u_logo
-                    re_name=self._re_m3u_name
-                    with open(path,'r',encoding='utf-8',errors='ignore') as f:
-                        lg="Uncategorized"
-                        for line in f:
-                            line=line.strip()
-                            if line.startswith("#EXTINF"):
-                                m=re_group.search(line)
-                                logo=re_logo.search(line)
-                                nm=re_name.search(line)
-                                lg=m.group(1) if m else "Uncategorized"
-                                if nm:
-                                    cn=nm.group(1).strip()
-                                    self.m3u_groups[self._normalize(cn)]=lg
-                                    if logo:self.m3u_logos[cn]=logo.group(1)
-                            elif line and not line.startswith("#"):self.url_to_group[line]=lg
+                    with open(path,"r",encoding="utf-8",errors="ignore") as f:
+                        self._parse_m3u_lines(f)
                 except:pass
-            cmd="loadlist" if path.lower().split('?')[0].endswith(pl_exts) else "loadfile"
+            elif is_remote:
+                try:
+                    data=urllib.request.urlopen(urllib.request.Request(path,headers={"User-Agent":"Mozilla/5.0"}),timeout=15).read().decode("utf-8",errors="ignore")
+                    if "#EXTINF" in data:
+                        self._parse_m3u_lines(data.splitlines())
+                except:pass
+            cmd="loadlist" if (not is_remote and path.lower().split("?")[0].endswith(pl_exts)) or (is_remote and bool(self.url_to_group)) else "loadfile"
             self.send_command({"command":[cmd,path,cmd_type]})
-        if not append:self.last_playlist_path=path
+        if not append:
+            self.last_playlist_path=path
+            self._playlist_needs_sort=True
         self.save_all_data()
         self.send_command({"command":["set_property","pause",False]})
-        QTimer.singleShot(500,self.update_playlist)
+        QTimer.singleShot(1500,self.update_playlist)
     def auto_load_last_m3u(self):
         if self.last_playlist_path:
             is_remote=self.last_playlist_path.startswith(('http://','https://','ftp://'))
@@ -667,7 +753,7 @@ class MPVQtManager(QMainWindow):
         if ok and url:self.load_playlist_file(url)
     def on_clear_clicked(self):
         self.send_command({"command":["playlist-clear"]})
-        self.m3u_groups,self.url_to_group,self.m3u_logos,self.logo_cache={},{},{},{}
+        self.m3u_groups,self.url_to_group,self.m3u_logos,self.logo_cache,self.url_to_name={},{},{},{},{}
         self.update_playlist()
     def on_right_click(self,pos):
         idx=self.tree_view.indexAt(pos)

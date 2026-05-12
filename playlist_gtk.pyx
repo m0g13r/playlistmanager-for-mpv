@@ -129,21 +129,18 @@ class EPGCellRenderer(Gtk.CellRenderer):
         desc = self._font_bold if self.weight > 500 else self._font_normal
         ctx.save()
         ctx.set_source_rgb(*text_rgb)
-        if self._layout is None:
-            self._layout = PangoCairo.create_layout(ctx)
-        else:
-            PangoCairo.update_layout(ctx, self._layout)
+        layout = PangoCairo.create_layout(ctx)
         
-        self._layout.set_text(self.display_text, -1)
-        self._layout.set_width(tw * Pango.SCALE)
-        self._layout.set_ellipsize(Pango.EllipsizeMode.END)
-        self._layout.set_font_description(desc)
+        layout.set_text(self.display_text, -1)
+        layout.set_width(tw * Pango.SCALE)
+        layout.set_ellipsize(Pango.EllipsizeMode.END)
+        layout.set_font_description(desc)
         ctx.move_to(tx, ty)
-        PangoCairo.show_layout(ctx, self._layout)
+        PangoCairo.show_layout(ctx, layout)
         ctx.restore()
 
         if self._has_epg and self.epg_title:
-            name_h = self._layout.get_pixel_size()[1]
+            name_h = layout.get_pixel_size()[1]
             ey = ty + max(name_h, 20) + 2
 
             # ── EPG subtitle + remaining time ─────────────────────────────
@@ -154,24 +151,24 @@ class EPGCellRenderer(Gtk.CellRenderer):
             if rem_str:
                 ctx.save()
                 ctx.set_source_rgb(*rem_rgb)
-                self._layout.set_text(rem_str, -1)
-                self._layout.set_font_description(self._font_small)
-                self._layout.set_width(-1) # reset width for measurement
-                rem_w, _ = self._layout.get_pixel_size()
+                layout.set_text(rem_str, -1)
+                layout.set_font_description(self._font_small)
+                layout.set_width(-1) # reset width for measurement
+                rem_w, _ = layout.get_pixel_size()
                 ctx.move_to(tx + tw - rem_w, ey)
-                PangoCairo.show_layout(ctx, self._layout)
+                PangoCairo.show_layout(ctx, layout)
                 ctx.restore()
 
             # EPG title (truncated so it doesn't overlap the time)
             ctx.save()
             ctx.set_source_rgb(*epg_rgb)
-            self._layout.set_text(self.epg_title, -1)
+            layout.set_text(self.epg_title, -1)
             avail = tw - rem_w - (8 if rem_w else 0)
-            self._layout.set_width(max(1, avail) * Pango.SCALE)
-            self._layout.set_ellipsize(Pango.EllipsizeMode.END)
-            self._layout.set_font_description(self._font_small)
+            layout.set_width(max(1, avail) * Pango.SCALE)
+            layout.set_ellipsize(Pango.EllipsizeMode.END)
+            layout.set_font_description(self._font_small)
             ctx.move_to(tx, ey)
-            PangoCairo.show_layout(ctx, self._layout)
+            PangoCairo.show_layout(ctx, layout)
             ctx.restore()
 
             # ── progress bar ──────────────────────────────────────────────
@@ -226,6 +223,7 @@ class MPVGTKManager(Gtk.Window):
         self.url_to_tvgid={}
         self.epg_data={}
         self.epg_path=""
+        self._epg_loading=False
         self.file_lock,self.update_lock,self.favorites_lock,self.logo_lock=threading.Lock(),threading.Lock(),threading.Lock(),threading.Lock()
         self.sort_mode,self.current_playing_path,self.current_group,self.is_updating,self.resume_done,self.last_file_path,self.is_paused=0,"","All",False,False,"",False
         self.last_playlist_path=""
@@ -361,7 +359,7 @@ class MPVGTKManager(Gtk.Window):
         GLib.timeout_add(1000,self.update_now_playing)
         GLib.timeout_add(5000,self.refresh_sockets)
         # EPG refresh every 30 s ───────────────────────────────────────────────
-        GLib.timeout_add(30000,self._update_epg_display)
+        GLib.timeout_add(30000,self._epg_timer_cb)
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _normalize(self,s):
@@ -419,6 +417,8 @@ class MPVGTKManager(Gtk.Window):
 
     def load_epg_file(self,path):
         """Load EPG XML (file path or HTTP URL) in a background thread."""
+        if self._epg_loading: return
+        self._epg_loading=True
         threading.Thread(target=self._load_epg_bg,args=(path,),daemon=True).start()
 
     def _load_epg_bg(self,path):
@@ -448,33 +448,49 @@ class MPVGTKManager(Gtk.Window):
             self.epg_data=epg
             self.epg_path=path
             self.save_all_data()
-            GLib.idle_add(self._update_epg_display)
+            GLib.idle_add(self._epg_idle_cb)
         except Exception:pass
+        finally:self._epg_loading=False
+
+    def _epg_timer_cb(self):
+        self._update_epg_display()
+        return True
+
+    def _epg_idle_cb(self):
+        self._update_epg_display()
+        return False
 
     def _update_epg_display(self):
         """Refresh EPG columns in the ListStore without rebuilding the whole list."""
-        if not self.epg_data: return True
+        if not self.epg_data or not self.get_visible(): return
+        
         cdef str fn, tvg_id, title
         cdef float prog
         cdef int rem
-        # Only update if the window is actually visible to save CPU
-        if not self.get_visible(): return True
         
-        # We still need to iterate, but let's make it as lean as possible
-        # For very large lists, this is still O(N). 
-        # A better way would be to only update visible rows, but ListStore doesn't easily support that.
-        for row in self.list_store:
-            fn = row[6]
-            tvg_id = self.url_to_tvgid.get(fn)
+        # Optimization: use iters directly (faster than row objects in PyGObject)
+        model = self.list_store
+        it = model.get_iter_first()
+        url_to_tvgid = self.url_to_tvgid
+        
+        while it:
+            fn = model.get_value(it, 6)
+            tvg_id = url_to_tvgid.get(fn)
             if tvg_id:
                 title, prog, rem = self.get_current_programme(tvg_id)
                 if title:
-                    if row[9] != title: row[9] = title
-                    if abs(row[10] - prog) > 0.01: row[10] = prog
-                    if row[11] != rem: row[11] = rem
-                elif row[9]:
-                    row[9] = ''; row[10] = -1.0; row[11] = 0
-        return True
+                    # Only set if changed to avoid unnecessary redraw signals
+                    if model.get_value(it, 9) != title:
+                        model.set_value(it, 9, title)
+                    if abs(model.get_value(it, 10) - prog) > 0.01:
+                        model.set_value(it, 10, prog)
+                    if model.get_value(it, 11) != rem:
+                        model.set_value(it, 11, rem)
+                elif model.get_value(it, 9): # Clear if it had EPG before
+                    model.set_value(it, 9, "")
+                    model.set_value(it, 10, -1.0)
+                    model.set_value(it, 11, 0)
+            it = model.iter_next(it)
 
     def on_load_epg_clicked(self,mi):
         """Show file-chooser or URL dialog for the EPG XML."""

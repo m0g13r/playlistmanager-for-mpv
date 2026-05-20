@@ -1,5 +1,5 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
-import sys,socket,json,os,subprocess,re,gi,threading,glob,urllib.request,tempfile,select,io,calendar
+import sys,socket,json,os,subprocess,re,gi,threading,glob,urllib.request,urllib.parse,http.client,tempfile,select,io,calendar,gzip
 import time as time_mod
 import xml.etree.ElementTree as ET
 from datetime import datetime as _datetime
@@ -222,9 +222,10 @@ class MPVGTKManager(Gtk.Window):
         self.url_to_name={}
         self.url_to_tvgid={}
         self.epg_data={}
+        self.epg_name_to_id={}
         self.epg_path=""
         self._epg_loading=False
-        self.file_lock,self.update_lock,self.favorites_lock,self.logo_lock=threading.Lock(),threading.Lock(),threading.Lock(),threading.Lock()
+        self.file_lock,self.update_lock,self.favorites_lock,self.logo_lock,self.epg_lock=threading.Lock(),threading.Lock(),threading.Lock(),threading.Lock(),threading.Lock()
         self.sort_mode,self.current_playing_path,self.current_group,self.is_updating,self.resume_done,self.last_file_path,self.is_paused=0,"","All",False,False,"",False
         self.last_playlist_path=""
         self.show_fab_enabled=True
@@ -396,10 +397,24 @@ class MPVGTKManager(Gtk.Window):
             return float(calendar.timegm(dt.timetuple())-tz_off)
         except:return 0.0
 
-    def get_current_programme(self,tvg_id):
-        """Return (title, progress 0-1, remaining_seconds) or (None, 0.0, 0)."""
+    def get_current_programme(self,tvg_id,name=None):
+        """Return (title, progress 0-1, remaining_seconds) or (None, 0.0, 0).
+        Tries tvg-id first, then exact name, then suffix-stripped variants, then substring fallback."""
         now=time_mod.time()
-        progs=self.epg_data.get(tvg_id)
+        progs=self.epg_data.get(tvg_id) if tvg_id else None
+        if not progs and name:
+            nl=name.lower()
+            # 1) exact display-name match
+            cid=self.epg_name_to_id.get(nl)
+            # 2) strip common suffixes (HD, FHD, country codes) and retry
+            if not cid:
+                stripped=re.sub(r'\s*(hd|fhd|uhd|4k|\(de\)|\(at\)|\(ch\)|\(uk\)|\(us\))\s*$','',nl,flags=re.IGNORECASE).strip()
+                if stripped!=nl:cid=self.epg_name_to_id.get(stripped)
+            # 3) substring match: EPG name contains our name or vice-versa
+            if not cid:
+                for epg_name,epg_cid in self.epg_name_to_id.items():
+                    if nl in epg_name or epg_name in nl:cid=epg_cid;break
+            if cid:progs=self.epg_data.get(cid)
         if not progs:return None,0.0,0
         lo,hi=0,len(progs)-1
         idx=-1
@@ -416,41 +431,69 @@ class MPVGTKManager(Gtk.Window):
         return None,0.0,0
 
     def load_epg_file(self,path):
-        """Load EPG XML (file path or HTTP URL) in a background thread."""
-        if self._epg_loading: return
-        self._epg_loading=True
+        """Load EPG XML (file path or HTTP URL) in a background thread.
+        Uses streaming HTTP so iterparse starts before the download finishes;
+        no single blocking timeout covers the whole response."""
+        with self.epg_lock:
+            if self._epg_loading:return
+            self._epg_loading=True
         threading.Thread(target=self._load_epg_bg,args=(path,),daemon=True).start()
+
+    def _epg_open_src(self,path):
+        if path.startswith(('http://','https://')):
+            proc=subprocess.Popen(['curl','-s','-L','--user-agent','Mozilla/5.0',path],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            return proc.stdout
+        elif path.endswith('.gz'):
+            return gzip.open(path,'rb')
+        else:
+            return open(path,'rb')
 
     def _load_epg_bg(self,path):
         try:
             now=time_mod.time()
             cutoff_old=now-4*3600
             cutoff_new=now+48*3600
-            if path.startswith(('http://','https://')):
-                req=urllib.request.Request(path,headers={'User-Agent':'Mozilla/5.0'})
-                data=urllib.request.urlopen(req,timeout=30).read()
-                src=io.BytesIO(data)
-            else:
-                src=path
-            epg={}
-            for event,elem in ET.iterparse(src,events=('end',)):
-                if elem.tag=='programme':
-                    ch=elem.get('channel','')
-                    start=self._parse_epg_time(elem.get('start',''))
-                    stop=self._parse_epg_time(elem.get('stop',''))
-                    if start and stop and start<cutoff_new and stop>cutoff_old:
-                        tel=elem.find('title')
-                        title=(tel.text or '') if tel is not None else ''
-                        if ch not in epg:epg[ch]=[]
-                        epg[ch].append((start,stop,title))
-                    elem.clear()
+            src=self._epg_open_src(path)
+            try:
+                epg={}
+                name_to_id={}
+                self.epg_data=epg
+                count=0
+                for event,elem in ET.iterparse(src,events=('end',)):
+                    if elem.tag=='channel':
+                        cid=elem.get('id','')
+                        if cid:
+                            for dn in elem.findall('display-name'):
+                                if dn.text:
+                                    raw=dn.text.strip().lower()
+                                    name_to_id[raw]=cid
+                                    stripped=re.sub(r'\s*(hd|fhd|uhd|4k|\(de\)|\(at\)|\(ch\)|\(uk\)|\(us\))\s*$','',raw,flags=re.IGNORECASE).strip()
+                                    if stripped!=raw:name_to_id.setdefault(stripped,cid)
+                        elem.clear()
+                    elif elem.tag=='programme':
+                        ch=elem.get('channel','')
+                        start=self._parse_epg_time(elem.get('start',''))
+                        stop=self._parse_epg_time(elem.get('stop',''))
+                        if start and stop and start<cutoff_new and stop>cutoff_old:
+                            tel=elem.find('title')
+                            title=(tel.text or '') if tel is not None else ''
+                            if ch not in epg:epg[ch]=[]
+                            epg[ch].append((start,stop,title))
+                            count+=1
+                            if count%100==0:
+                                GLib.idle_add(self._epg_idle_cb)
+                        elem.clear()
+            finally:
+                try:src.close()
+                except:pass
             for ch in epg:epg[ch].sort(key=lambda x:x[0])
-            self.epg_data=epg
+            self.epg_name_to_id=name_to_id
             self.epg_path=path
             self.save_all_data()
-            GLib.idle_add(self._epg_idle_cb)
+            GLib.idle_add(self._epg_load_done_cb)
         except Exception:pass
-        finally:self._epg_loading=False
+        finally:
+            with self.epg_lock:self._epg_loading=False
 
     def _epg_timer_cb(self):
         self._update_epg_display()
@@ -460,36 +503,33 @@ class MPVGTKManager(Gtk.Window):
         self._update_epg_display()
         return False
 
+    def _epg_load_done_cb(self):
+        self.update_playlist()
+        return False
+
     def _update_epg_display(self):
         """Refresh EPG columns in the ListStore without rebuilding the whole list."""
-        if not self.epg_data or not self.get_visible(): return
-        
-        cdef str fn, tvg_id, title
-        cdef float prog
-        cdef int rem
-        
-        # Optimization: use iters directly (faster than row objects in PyGObject)
-        model = self.list_store
-        it = model.get_iter_first()
-        url_to_tvgid = self.url_to_tvgid
+        if not self.epg_data or not self.get_visible():return
+        model=self.list_store
+        it=model.get_iter_first()
+        url_to_tvgid=self.url_to_tvgid
         
         while it:
             fn = model.get_value(it, 6)
             tvg_id = url_to_tvgid.get(fn)
-            if tvg_id:
-                title, prog, rem = self.get_current_programme(tvg_id)
-                if title:
-                    # Only set if changed to avoid unnecessary redraw signals
-                    if model.get_value(it, 9) != title:
-                        model.set_value(it, 9, title)
-                    if abs(model.get_value(it, 10) - prog) > 0.01:
-                        model.set_value(it, 10, prog)
-                    if model.get_value(it, 11) != rem:
-                        model.set_value(it, 11, rem)
-                elif model.get_value(it, 9): # Clear if it had EPG before
-                    model.set_value(it, 9, "")
-                    model.set_value(it, 10, -1.0)
-                    model.set_value(it, 11, 0)
+            nm = model.get_value(it, 7)
+            title, prog, rem = self.get_current_programme(tvg_id, nm)
+            if title:
+                if model.get_value(it, 9) != title:
+                    model.set_value(it, 9, title)
+                if abs(model.get_value(it, 10) - prog) > 0.01:
+                    model.set_value(it, 10, prog)
+                if model.get_value(it, 11) != rem:
+                    model.set_value(it, 11, rem)
+            elif model.get_value(it, 9):
+                model.set_value(it, 9, "")
+                model.set_value(it, 10, -1.0)
+                model.set_value(it, 11, 0)
             it = model.iter_next(it)
 
     def on_load_epg_clicked(self,mi):
@@ -799,9 +839,8 @@ class MPVGTKManager(Gtk.Window):
             epg_title=""; epg_prog=-1.0; epg_rem=0
             if have_epg:
                 tvg_id=self.url_to_tvgid.get(fn)
-                if tvg_id:
-                    t,p,r=self.get_current_programme(tvg_id)
-                    if t:epg_title=t; epg_prog=p; epg_rem=r
+                t,p,r=self.get_current_programme(tvg_id,nm)
+                if t:epg_title=t; epg_prog=p; epg_rem=r
             ls_append([dn,item_obj.orig_idx,w,item_obj.group,fg,bg,fn,nm,nm.lower(),epg_title,epg_prog,epg_rem])
             if is_p:
                 active_store_path=len(self.list_store)-1
@@ -871,10 +910,10 @@ class MPVGTKManager(Gtk.Window):
         return True
 
     def _update_playing_state_ui(self):
-        with self.favorites_lock: fav_copy = set(self.favorites)
-        cdef str curr_p = self.current_playing_path
-        cdef str last_p = self._last_playing_path
-        cdef bint paused = self.is_paused
+        with self.favorites_lock:fav_copy=set(self.favorites)
+        curr_p=self.current_playing_path
+        last_p=self._last_playing_path
+        paused=self.is_paused
         
         if curr_p == last_p and self._last_pause_state == paused:
             return
@@ -1148,6 +1187,29 @@ class MPVGTKManager(Gtk.Window):
         self.url_to_tvgid=new_url_to_tvgid
         return entries
 
+    def _fetch_and_load_m3u(self,path,append):
+        """Background: download remote M3U/M3U8 without timeout, parse and push to mpv."""
+        try:
+            req=urllib.request.Request(path,headers={"User-Agent":"Mozilla/5.0"})
+            data=urllib.request.urlopen(req).read().decode("utf-8",errors="ignore")
+            if "#EXTINF" in data or "#EXTM3U" in data:
+                entries=self._parse_m3u_lines(data.splitlines())
+                if entries:
+                    if not append:
+                        self.send_command({"command":["stop"]})
+                        self.send_command({"command":["playlist-clear"]})
+                    for i in range(0,len(entries),500):
+                        self.send_commands_batch([{"command":["loadfile",url,"append"]} for url in entries[i:i+500]])
+                    self.send_command({"command":["set_property","pause",False]})
+                    return
+        except:pass
+        # Fallback
+        pl_exts=('.m3u','.m3u8','.pls','.xspf','.cue','.asx','.txt')
+        cmd="loadlist" if path.lower().split("?")[0].endswith(pl_exts) else "loadfile"
+        cmd_type="append" if append else "replace"
+        self.send_command({"command":[cmd,path,cmd_type]})
+        self.send_command({"command":["set_property","pause",False]})
+
     def load_playlist_file(self,path,append=False):
         cdef bint is_remote
         cdef str lg,line,cn,cmd,cmd_type,temp_m3u,root,f_name
@@ -1190,18 +1252,17 @@ class MPVGTKManager(Gtk.Window):
                         m3u_entries=self._parse_m3u_lines(f)
                 except:pass
             elif is_remote:
-                try:
-                    req=urllib.request.Request(path,headers={"User-Agent":"Mozilla/5.0"})
-                    m3u_content=urllib.request.urlopen(req,timeout=15).read().decode("utf-8",errors="ignore")
-                    if "#EXTINF" in m3u_content:
-                        m3u_entries=self._parse_m3u_lines(m3u_content.splitlines())
-                except:pass
+                threading.Thread(target=self._fetch_and_load_m3u,args=(path,append),daemon=True).start()
+                if not append:
+                    self.last_playlist_path=path
+                    self._playlist_needs_sort=True
+                self.save_all_data()
+                return
 
             if m3u_entries:
                 if not append:
                     self.send_command({"command":["stop"]})
                     self.send_command({"command":["playlist-clear"]})
-                # Load in batches of 500 for performance
                 for i in range(0,len(m3u_entries),500):
                     batch=[{"command":["loadfile",url,"append"]} for url in m3u_entries[i:i+500]]
                     self.send_commands_batch(batch)
@@ -1269,13 +1330,12 @@ class MPVGTKManager(Gtk.Window):
         c.finish(True,False,t)
 
     def auto_load_last_m3u(self):
+        if self.epg_path:
+            GLib.idle_add(lambda:self.load_epg_file(self.epg_path) or False)
         if self.last_playlist_path:
             is_remote=self.last_playlist_path.startswith(('http://','https://','ftp://'))
             if is_remote or os.path.exists(self.last_playlist_path):
                 self.load_playlist_file(self.last_playlist_path)
-                # Reload EPG after playlist is loaded (delay so tvg-ids are parsed)
-                if self.epg_path:
-                    GLib.timeout_add(3000,lambda:self.load_epg_file(self.epg_path) or False)
                 return False
         self.update_playlist()
         return False

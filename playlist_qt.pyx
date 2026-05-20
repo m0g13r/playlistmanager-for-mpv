@@ -1,5 +1,5 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
-import sys,socket,json,os,subprocess,re,threading,glob,urllib.request,tempfile,select,io,calendar
+import sys,socket,json,os,subprocess,re,threading,glob,urllib.request,urllib.parse,http.client,tempfile,select,io,calendar,gzip
 import time as time_mod
 import xml.etree.ElementTree as ET
 from datetime import datetime as _datetime
@@ -30,6 +30,8 @@ class UpdateSignals(QObject):
     finished=Signal(dict,list,str,bool)
     logo_loaded=Signal(object,QPoint)
     sockets_refreshed=Signal(list)
+    epg_updated=Signal()
+    epg_loaded=Signal()
 
 class LogoPopup(QLabel):
     def __init__(self):
@@ -189,12 +191,15 @@ class MPVQtManager(QMainWindow):
         self.url_to_name={}
         self.url_to_tvgid={}          # url → tvg-id
         self.epg_data={}              # channel-id → [(start_ts, stop_ts, title), …]
+        self.epg_name_to_id={}        # display-name (lower) → channel-id
         self.epg_path=""
         self._nkey_cache={}
         self._norm_cache={}
         self.sort_mode,self.current_playing_filename,self.is_paused,self.current_group=0,"",False,"All"
         self.full_list,self.group_counts,self.is_updating,self.resume_done,self.last_file,self.last_playlist_path=[],{},False,False,"",""
         self.show_fab_enabled,self.show_logos_enabled=True,True
+        self._epg_loading=False
+        self.epg_lock=threading.Lock()
         self._logo_hover_active=False
         self._current_hover_url=None
         self._last_hover_idx=None
@@ -211,6 +216,8 @@ class MPVQtManager(QMainWindow):
         self.signals.finished.connect(self._finalize_update)
         self.signals.sockets_refreshed.connect(self._apply_socket_refresh)
         self.signals.logo_loaded.connect(self._show_logo_popup)
+        self.signals.epg_updated.connect(self._update_epg_display)
+        self.signals.epg_loaded.connect(self.filter_playlist)
         self.apply_styles()
         self.ensure_mpv_running()
         central=QWidget()
@@ -332,10 +339,24 @@ class MPVQtManager(QMainWindow):
             return float(calendar.timegm(dt.timetuple())-tz_off)
         except:return 0.0
 
-    def get_current_programme(self,tvg_id):
-        """Return (title, progress 0-1, remaining_seconds) or (None,0,0)."""
+    def get_current_programme(self,tvg_id,name=None):
+        """Return (title, progress 0-1, remaining_seconds) or (None,0,0).
+        Tries tvg-id first, then exact name, then suffix-stripped variants, then substring fallback."""
         now=time_mod.time()
-        progs=self.epg_data.get(tvg_id)
+        progs=self.epg_data.get(tvg_id) if tvg_id else None
+        if not progs and name:
+            nl=name.lower()
+            # 1) exact display-name match
+            cid=self.epg_name_to_id.get(nl)
+            # 2) strip common suffixes (HD, FHD, country codes) and retry
+            if not cid:
+                stripped=re.sub(r'\s*(hd|fhd|uhd|4k|\(de\)|\(at\)|\(ch\)|\(uk\)|\(us\))\s*$','',nl,flags=re.IGNORECASE).strip()
+                if stripped!=nl:cid=self.epg_name_to_id.get(stripped)
+            # 3) substring match: EPG name contains our name or vice-versa
+            if not cid:
+                for epg_name,epg_cid in self.epg_name_to_id.items():
+                    if nl in epg_name or epg_name in nl:cid=epg_cid;break
+            if cid:progs=self.epg_data.get(cid)
         if not progs:return None,0.0,0
         # binary-search for the last programme that has started
         lo,hi=0,len(progs)-1
@@ -353,23 +374,45 @@ class MPVQtManager(QMainWindow):
         return None,0.0,0
 
     def load_epg_file(self,path):
-        """Load EPG XML (file path or HTTP URL) in a background thread."""
+        """Load EPG XML (file path or HTTP URL) in a background thread.
+        Uses streaming HTTP so iterparse starts before the download finishes."""
+        with self.epg_lock:
+            if self._epg_loading:return
+            self._epg_loading=True
         threading.Thread(target=self._load_epg_bg,args=(path,),daemon=True).start()
 
+    def _epg_open_src(self,path):
+        if path.startswith(('http://','https://')):
+            proc=subprocess.Popen(['curl','-s','-L','--user-agent','Mozilla/5.0',path],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            return proc.stdout
+        elif path.endswith('.gz'):
+            return gzip.open(path,'rb')
+        else:
+            return open(path,'rb')
+
     def _load_epg_bg(self,path):
+        epg={}
+        self.epg_data=epg
+        src=None
         try:
             now=time_mod.time()
             cutoff_old=now-4*3600
             cutoff_new=now+48*3600
-            if path.startswith(('http://','https://')):
-                req=urllib.request.Request(path,headers={'User-Agent':'Mozilla/5.0'})
-                data=urllib.request.urlopen(req,timeout=30).read()
-                src=io.BytesIO(data)
-            else:
-                src=path
-            epg={}
+            src=self._epg_open_src(path)
+            name_to_id={}
+            count=0
             for event,elem in ET.iterparse(src,events=('end',)):
-                if elem.tag=='programme':
+                if elem.tag=='channel':
+                    cid=elem.get('id','')
+                    if cid:
+                        for dn in elem.findall('display-name'):
+                            if dn.text:
+                                raw=dn.text.strip().lower()
+                                name_to_id[raw]=cid
+                                stripped=re.sub(r'\s*(hd|fhd|uhd|4k|\(de\)|\(at\)|\(ch\)|\(uk\)|\(us\))\s*$','',raw,flags=re.IGNORECASE).strip()
+                                if stripped!=raw:name_to_id.setdefault(stripped,cid)
+                    elem.clear()
+                elif elem.tag=='programme':
                     ch=elem.get('channel','')
                     start=self._parse_epg_time(elem.get('start',''))
                     stop=self._parse_epg_time(elem.get('stop',''))
@@ -378,37 +421,46 @@ class MPVQtManager(QMainWindow):
                         title=(tel.text or '') if tel is not None else ''
                         if ch not in epg:epg[ch]=[]
                         epg[ch].append((start,stop,title))
+                        count+=1
+                        if count%100==0:
+                            self.signals.epg_updated.emit()
                     elem.clear()
-            for ch in epg:epg[ch].sort(key=lambda x:x[0])
-            self.epg_data=epg
+        except Exception:pass
+        finally:
+            try:src.close()
+            except:pass
+        for ch in epg:epg[ch].sort(key=lambda x:x[0])
+        self.epg_name_to_id=name_to_id
+        if epg:
             self.epg_path=path
             self.save_all_data()
-            # Full rebuild so sizeHint is re-queried and EPG rows get correct height
-            QTimer.singleShot(0,self.filter_playlist)
-        except Exception:pass
+        self.signals.epg_loaded.emit()
+        with self.epg_lock:self._epg_loading=False
 
     def _update_epg_display(self):
         """Refresh progress/remaining values every 30 s — no layout change needed
         because heights are already correct after the initial filter_playlist call."""
         if not self.epg_data:return
-        changed=False
+        first_changed=-1
+        last_changed=-1
         for r in range(self.list_model.rowCount()):
             item=self.list_model.item(r)
             if item is None:continue
             fn=item.data(self.FILENAME_ROLE)
             if not fn:continue
             tvg_id=self.url_to_tvgid.get(fn)
-            if not tvg_id:continue
-            title,prog,rem=self.get_current_programme(tvg_id)
+            nm=item.data(self.RAW_NAME_ROLE)
+            if not tvg_id and not self.epg_name_to_id:continue
+            title,prog,rem=self.get_current_programme(tvg_id,nm)
             new_epg=(title,prog,rem) if title else None
             if item.data(self.EPG_ROLE)!=new_epg:
                 item.setData(new_epg,self.EPG_ROLE)
-                changed=True
-        if changed:
-            top=self.list_model.index(0,0)
-            bot=self.list_model.index(max(0,self.list_model.rowCount()-1),0)
+                if first_changed<0:first_changed=r
+                last_changed=r
+        if first_changed>=0:
+            top=self.list_model.index(first_changed,0)
+            bot=self.list_model.index(last_changed,0)
             self.list_model.dataChanged.emit(top,bot)
-            self.tree_view.updateGeometries()
 
     def on_load_epg_clicked(self):
         """Open file dialog or accept a URL for the EPG XML."""
@@ -870,10 +922,9 @@ class MPVQtManager(QMainWindow):
             # EPG data ────────────────────────────────────────────────────
             if have_epg:
                 tvg_id=self.url_to_tvgid.get(fn)
-                if tvg_id:
-                    title,prog,rem=self.get_current_programme(tvg_id)
-                    if title:
-                        qi.setData((title,prog,rem),self.EPG_ROLE)
+                title,prog,rem=self.get_current_programme(tvg_id,nm)
+                if title:
+                    qi.setData((title,prog,rem),self.EPG_ROLE)
             if isp:
                 qi.setFont(bold_font)
                 qi.setBackground(playing_bg)
@@ -1017,6 +1068,29 @@ class MPVQtManager(QMainWindow):
         self.url_to_tvgid=new_url_to_tvgid
         return entries
 
+    def _fetch_and_load_m3u(self,path,append):
+        """Background: download remote M3U/M3U8 without timeout, parse and push to mpv."""
+        try:
+            req=urllib.request.Request(path,headers={"User-Agent":"Mozilla/5.0"})
+            data=urllib.request.urlopen(req).read().decode("utf-8",errors="ignore")
+            if "#EXTINF" in data or "#EXTM3U" in data:
+                entries=self._parse_m3u_lines(data.splitlines())
+                if entries:
+                    if not append:
+                        self.send_command({"command":["stop"]})
+                        self.send_command({"command":["playlist-clear"]})
+                    for i in range(0,len(entries),500):
+                        self.send_commands_batch([{"command":["loadfile",url,"append"]} for url in entries[i:i+500]])
+                    self.send_command({"command":["set_property","pause",False]})
+                    return
+        except:pass
+        # Fallback: let mpv load it directly
+        pl_exts=('.m3u','.m3u8','.pls','.xspf','.cue','.asx','.txt')
+        cmd="loadlist" if path.lower().split("?")[0].endswith(pl_exts) else "loadfile"
+        cmd_type="append" if append else "replace"
+        self.send_command({"command":[cmd,path,cmd_type]})
+        self.send_command({"command":["set_property","pause",False]})
+
     def load_playlist_file(self,path,append=False):
         cdef bint is_remote
         cdef str lg,line,cn,cmd,cmd_type,temp_m3u,root,f_name
@@ -1055,12 +1129,13 @@ class MPVQtManager(QMainWindow):
                         m3u_entries=self._parse_m3u_lines(f)
                 except:pass
             elif is_remote:
-                try:
-                    req=urllib.request.Request(path,headers={"User-Agent":"Mozilla/5.0"})
-                    m3u_content=urllib.request.urlopen(req,timeout=15).read().decode("utf-8",errors="ignore")
-                    if "#EXTINF" in m3u_content:
-                        m3u_entries=self._parse_m3u_lines(m3u_content.splitlines())
-                except:pass
+                # Fetch in background — update_now_playing detects new items automatically
+                threading.Thread(target=self._fetch_and_load_m3u,args=(path,append),daemon=True).start()
+                if not append:
+                    self.last_playlist_path=path
+                    self._playlist_needs_sort=True
+                self.save_all_data()
+                return
 
             if m3u_entries:
                 if not append:
@@ -1081,6 +1156,8 @@ class MPVQtManager(QMainWindow):
         QTimer.singleShot(1500,self.update_playlist)
 
     def auto_load_last_m3u(self):
+        if self.epg_path:
+            QTimer.singleShot(0,lambda:self.load_epg_file(self.epg_path))
         if self.last_playlist_path:
             is_remote=self.last_playlist_path.startswith(('http://','https://','ftp://'))
             if is_remote or os.path.exists(self.last_playlist_path):
@@ -1166,7 +1243,5 @@ if __name__=="__main__":
     app=QApplication(sys.argv)
     win=MPVQtManager()
     win.show()
-    # Re-load EPG from saved path (after playlist is loaded in auto_load_last_m3u)
-    if win.epg_path:
-        QTimer.singleShot(3000,lambda:win.load_epg_file(win.epg_path))
+    # EPG is reloaded automatically in auto_load_last_m3u
     sys.exit(app.exec())
